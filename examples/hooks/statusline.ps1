@@ -147,7 +147,7 @@ try {
                     if ($seenServers.ContainsKey($name)) { continue }
                     $seenServers[$name] = $true
                     $url  = $srv.Value.url
-                    # Command-based servers (playwright, bsl-lsp, etc.) have no URL
+                    # Command-based servers (e.g. playwright, local LSP bridges) have no URL
                     if (-not $url) {
                         $mcpStatuses += "${dim}${name}?$reset"
                         continue
