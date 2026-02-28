@@ -1,0 +1,19 @@
+# Normalize line endings to LF in the repository
+* text=auto eol=lf
+
+# PowerShell scripts — keep LF (works on Windows too)
+*.ps1 text eol=lf
+
+# Shell scripts — LF required
+*.sh text eol=lf
+
+# Docker
+Dockerfile text eol=lf
+
+# Markdown
+*.md text eol=lf
+
+# JSON/YAML
+*.json text eol=lf
+*.yml text eol=lf
+*.yaml text eol=lf
