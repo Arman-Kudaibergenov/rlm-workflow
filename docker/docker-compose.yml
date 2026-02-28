@@ -1,0 +1,28 @@
+version: "3.9"
+
+services:
+  rlm:
+    image: ghcr.io/YOUR_USERNAME/rlm:latest
+    # Or build locally:
+    # build: .
+    container_name: rlm
+    restart: unless-stopped
+    ports:
+      - "${RLM_PORT:-8200}:8200"
+    volumes:
+      - rlm-data:/data
+    environment:
+      - RLM_DATA_DIR=/data
+      - RLM_EMBEDDING_PROVIDER=${RLM_EMBEDDING_PROVIDER:-fastembed}
+      - OPENAI_API_KEY=${OPENAI_API_KEY:-}
+      - OLLAMA_BASE_URL=${OLLAMA_BASE_URL:-}
+      - RLM_EMBEDDING_MODEL=${RLM_EMBEDDING_MODEL:-nomic-embed-text}
+    deploy:
+      resources:
+        limits:
+          cpus: "2"
+          memory: 2G
+
+volumes:
+  rlm-data:
+    driver: local
