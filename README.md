@@ -2,7 +2,7 @@
 
 > Persistent AI memory across sessions using RLM-Toolkit — customized workflow for Claude Code.
 
-**[Читать на русском](README.ru.md)**
+**Основная документация на русском: [README.ru.md](README.ru.md)**
 
 ---
 

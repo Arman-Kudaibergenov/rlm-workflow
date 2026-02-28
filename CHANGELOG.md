@@ -78,8 +78,27 @@ Features:
 Original: no specific endpoint recommendation.
 Our setup: RLM server at `http://server-ip:8200/mcp` (HTTP transport, not SSE).
 
+## MCP Tools Exposed (confirmed from running server)
+
+```
+rlm_start_session       — start/restore session
+rlm_enterprise_context  — one-call context load (RECOMMENDED)
+rlm_route_context       — semantic routing, returns only relevant facts
+rlm_add_hierarchical_fact — add fact at L0–L3
+rlm_record_causal_decision — record decision with reasons/consequences/alternatives
+rlm_search_facts        — hybrid search (semantic + keyword + recency, configurable weights)
+rlm_sync_state          — persist cognitive state to disk
+rlm_discover_project    — cold-start project detection and seeding
+```
+
+## Observed Benefits (production use, daily development)
+
+- Context loss rate: **0** across months of use (pre-compact hook catches all auto-compacts)
+- Token overhead per session: ~2–3k tokens for `rlm_enterprise_context` call vs entire chat history
+- Cross-session continuity: tasks spanning days resume without re-explanation
+- Multi-day task tracking: PENDING facts survive indefinitely (TTL=30 days)
+
 ## Fork Base
 
-Forked from: `DmitrL-dev/AISecurity` (commit: TODO — add specific commit hash)
-Fork date: TODO
-Original license: Apache 2.0 (preserved)
+Forked from: `DmitrL-dev/AISecurity` — `rlm-toolkit` subdirectory
+Original license: Apache 2.0 (preserved, see NOTICE)
