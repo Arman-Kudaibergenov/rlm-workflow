@@ -2,7 +2,7 @@ version: "3.9"
 
 services:
   rlm:
-    image: ghcr.io/YOUR_USERNAME/rlm:latest
+    image: ghcr.io/admin/rlm:latest
     # Or build locally:
     # build: .
     container_name: rlm
