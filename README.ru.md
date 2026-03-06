@@ -29,7 +29,7 @@ docker run -d --name rlm --restart unless-stopped \
   ghcr.io/arman-kudaibergenov/rlm-workflow:latest
 
 # Или через Docker Compose
-curl -O https://raw.githubusercontent.com/Arman-Kudaibergenov/rlm-workflow/main/docker/docker-compose.yml
+curl -O https://raw.githubusercontent.com/Arman-Kudaibergenov/rlm-workflow/master/docker/docker-compose.yml
 docker compose up -d
 ```
 
@@ -43,6 +43,12 @@ docker compose up -d
     }
   }
 }
+```
+
+Скопировать шаблон CLAUDE.md в корень проекта (**обязательно** — без него ритуалы не работают):
+```bash
+curl -o CLAUDE.md https://raw.githubusercontent.com/Arman-Kudaibergenov/rlm-workflow/master/examples/CLAUDE.md.example
+# Отредактируйте секции [YOUR ...] под свой проект
 ```
 
 ---

@@ -36,11 +36,15 @@ docker run -d \
 
 # Add to Claude Code MCP config (~/.claude/mcp.json)
 # See docs/en/installation.md for full configuration
+
+# REQUIRED: Copy CLAUDE.md template (rituals won't work without it)
+curl -o CLAUDE.md https://raw.githubusercontent.com/Arman-Kudaibergenov/rlm-workflow/master/examples/CLAUDE.md.example
+# Edit the [YOUR ...] sections for your project
 ```
 
 Or with Docker Compose:
 ```bash
-curl -O https://raw.githubusercontent.com/Arman-Kudaibergenov/rlm-workflow/main/docker/docker-compose.yml
+curl -O https://raw.githubusercontent.com/Arman-Kudaibergenov/rlm-workflow/master/docker/docker-compose.yml
 cp docker/.env.example .env
 # Edit .env with your settings
 docker compose up -d

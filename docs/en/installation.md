@@ -22,8 +22,8 @@ docker run -d \
 
 ```bash
 # Download compose file
-curl -O https://raw.githubusercontent.com/Arman-Kudaibergenov/rlm-workflow/main/docker/docker-compose.yml
-curl -O https://raw.githubusercontent.com/Arman-Kudaibergenov/rlm-workflow/main/docker/.env.example
+curl -O https://raw.githubusercontent.com/Arman-Kudaibergenov/rlm-workflow/master/docker/docker-compose.yml
+curl -O https://raw.githubusercontent.com/Arman-Kudaibergenov/rlm-workflow/master/docker/.env.example
 cp .env.example .env
 
 # Edit .env if needed (default: fastembed, no API key required)
@@ -65,7 +65,7 @@ Restart Claude Code — run `claude mcp list` to verify the server is connected.
 Copy the example CLAUDE.md template to your project:
 
 ```bash
-curl -O https://raw.githubusercontent.com/Arman-Kudaibergenov/rlm-workflow/main/examples/CLAUDE.md.example
+curl -O https://raw.githubusercontent.com/Arman-Kudaibergenov/rlm-workflow/master/examples/CLAUDE.md.example
 # Rename and customize for your project
 ```
 
