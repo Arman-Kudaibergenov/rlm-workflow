@@ -26,10 +26,10 @@ RLM-Toolkit — внешний MCP-сервер, хранящий факты и 
 # Запустить RLM-сервер (FastEmbed, без GPU и API-ключей)
 docker run -d --name rlm --restart unless-stopped \
   -p 8200:8200 -v rlm-data:/data \
-  ghcr.io/admin/rlm:latest
+  ghcr.io/arman-kudaibergenov/rlm-workflow:latest
 
 # Или через Docker Compose
-curl -O https://raw.githubusercontent.com/admin/rlm/main/docker/docker-compose.yml
+curl -O https://raw.githubusercontent.com/Arman-Kudaibergenov/rlm-workflow/main/docker/docker-compose.yml
 docker compose up -d
 ```
 

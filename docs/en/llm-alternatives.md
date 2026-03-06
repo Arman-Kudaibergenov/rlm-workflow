@@ -14,10 +14,11 @@ RLM_EMBEDDING_PROVIDER=fastembed
 # No other config needed
 ```
 
-Models available:
-- `BAAI/bge-small-en-v1.5` — 35MB, fast
-- `BAAI/bge-large-en-v1.5` — 1.2GB, accurate
-- Default is auto-selected based on available memory
+The original RLM-Toolkit defaults to `all-MiniLM-L6-v2` (~80MB) — fast and lightweight, but **English only**.
+
+Our infrastructure uses `qwen3-embedding:8b` via Ollama on a dedicated GPU server (see "Our Infrastructure" section below).
+
+The Docker image defaults to `paraphrase-multilingual-MiniLM-L12-v2` (~471MB) — a multilingual model (50+ languages including Russian, Chinese, Arabic), runs on CPU without GPU. You can always replace it with any model you prefer via the `RLM_EMBEDDING_MODEL` variable in `.env`.
 
 **Use this if**: you want zero setup, don't have a GPU, don't want API costs.
 

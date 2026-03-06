@@ -5,7 +5,7 @@ DATA_DIR="${RLM_DATA_DIR:-/data}"
 HOST="${RLM_HOST:-0.0.0.0}"
 PORT="${RLM_PORT:-8200}"
 EMBEDDING_PROVIDER="${RLM_EMBEDDING_PROVIDER:-fastembed}"
-EMBEDDING_MODEL="${RLM_EMBEDDING_MODEL:-}"
+EMBEDDING_MODEL="${RLM_EMBEDDING_MODEL:-paraphrase-multilingual-MiniLM-L12-v2}"
 
 echo "Starting RLM-Toolkit MCP server"
 echo "  Data dir:  $DATA_DIR"

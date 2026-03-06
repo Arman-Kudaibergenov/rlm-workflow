@@ -32,7 +32,7 @@ docker run -d \
   --name rlm \
   -p 8200:8200 \
   -v rlm-data:/data \
-  ghcr.io/admin/rlm:latest
+  ghcr.io/arman-kudaibergenov/rlm-workflow:latest
 
 # Add to Claude Code MCP config (~/.claude/mcp.json)
 # See docs/en/installation.md for full configuration
@@ -40,7 +40,7 @@ docker run -d \
 
 Or with Docker Compose:
 ```bash
-curl -O https://raw.githubusercontent.com/admin/rlm/main/docker/docker-compose.yml
+curl -O https://raw.githubusercontent.com/Arman-Kudaibergenov/rlm-workflow/main/docker/docker-compose.yml
 cp docker/.env.example .env
 # Edit .env with your settings
 docker compose up -d
