@@ -1,5 +1,3 @@
-version: "3.9"
-
 services:
   rlm:
     image: ghcr.io/arman-kudaibergenov/rlm-workflow:latest
@@ -13,10 +11,11 @@ services:
       - rlm-data:/data
     environment:
       - RLM_DATA_DIR=/data
-      - RLM_EMBEDDING_PROVIDER=${RLM_EMBEDDING_PROVIDER:-fastembed}
+      - RLM_HOST=0.0.0.0
+      - RLM_PORT=8200
+      - RLM_TRANSPORT=${RLM_TRANSPORT:-sse}
       - OPENAI_API_KEY=${OPENAI_API_KEY:-}
       - OLLAMA_BASE_URL=${OLLAMA_BASE_URL:-}
-      - RLM_EMBEDDING_MODEL=${RLM_EMBEDDING_MODEL:-paraphrase-multilingual-MiniLM-L12-v2}
     deploy:
       resources:
         limits:
