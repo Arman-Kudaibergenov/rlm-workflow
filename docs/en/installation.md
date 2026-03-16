@@ -18,6 +18,22 @@ docker run -d \
   ghcr.io/arman-kudaibergenov/rlm-workflow:latest
 ```
 
+`rlm-data:/data` is the required persistence volume. You do not need to mount your project source tree unless you want file-based discovery from inside the container.
+
+Example with optional project mount:
+
+```bash
+docker run -d \
+  --name rlm \
+  -p 8200:8200 \
+  -v rlm-data:/data \
+  -v /path/to/project:/workspace:ro \
+  -e RLM_PROJECT_ROOT=/workspace \
+  ghcr.io/arman-kudaibergenov/rlm-workflow:latest
+```
+
+On Docker Desktop for Windows, prefer an ASCII-only alias path for bind mounts if the real path contains spaces or Cyrillic characters.
+
 ### Docker Compose
 
 ```bash

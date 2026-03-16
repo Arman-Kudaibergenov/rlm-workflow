@@ -8,9 +8,14 @@ services:
     ports:
       - "${RLM_PORT:-8200}:8200"
     volumes:
+      # Required persistence volume for RLM facts, indexes, and session state
       - rlm-data:/data
+      # Optional project bind mount example:
+      # - ${PROJECT_PATH:-./project}:/workspace:ro
     environment:
       - RLM_DATA_DIR=/data
+      # Optional: point project discovery at a mounted workspace path
+      # - RLM_PROJECT_ROOT=/workspace
       - RLM_HOST=0.0.0.0
       - RLM_PORT=8200
       - RLM_TRANSPORT=${RLM_TRANSPORT:-sse}

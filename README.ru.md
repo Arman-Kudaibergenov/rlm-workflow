@@ -33,6 +33,28 @@ curl -O https://raw.githubusercontent.com/Arman-Kudaibergenov/rlm-workflow/maste
 docker compose up -d
 ```
 
+## Volume: что обязательно, а что нет
+
+Есть два разных сценария:
+
+- обязательно для обычной работы RLM: volume вида `rlm-data:/data`
+- опционально для доступа контейнера к файлам проекта: отдельный bind mount с проектом
+
+Для самой памяти RLM исходники проекта не нужны. Стандартного `-v rlm-data:/data` достаточно для фактов, индексов и продолжения сессий.
+
+Если нужен file-based discovery внутри контейнера, добавьте второй mount и укажите `RLM_PROJECT_ROOT`:
+
+```bash
+docker run -d --name rlm --restart unless-stopped \
+  -p 8200:8200 \
+  -v rlm-data:/data \
+  -v /path/to/project:/workspace:ro \
+  -e RLM_PROJECT_ROOT=/workspace \
+  ghcr.io/arman-kudaibergenov/rlm-workflow:latest
+```
+
+На Docker Desktop для Windows bind mount может ломаться на путях с пробелами и кириллицей. В таком случае лучше смонтировать ASCII-алиас или junction.
+
 Добавить в `~/.claude/mcp.json`:
 ```json
 {

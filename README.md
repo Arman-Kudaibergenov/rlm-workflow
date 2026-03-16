@@ -50,6 +50,31 @@ cp docker/.env.example .env
 docker compose up -d
 ```
 
+## Docker volumes: what is required and what is optional
+
+There are two separate concerns:
+
+- Required for normal RLM operation: persistent data volume such as `rlm-data:/data`
+- Optional for project file discovery: an extra bind mount with your project files
+
+RLM does not need your project source tree just to work as a memory server. The standard `-v rlm-data:/data` volume is enough for facts, indexes, and session continuity.
+
+If you want file-based project discovery from inside the container, add a second bind mount and point `RLM_PROJECT_ROOT` at it. Example:
+
+```bash
+docker run -d \
+  --name rlm \
+  -p 8200:8200 \
+  -v rlm-data:/data \
+  -v /path/to/project:/workspace:ro \
+  -e RLM_PROJECT_ROOT=/workspace \
+  ghcr.io/arman-kudaibergenov/rlm-workflow:latest
+```
+
+### Windows note
+
+On Docker Desktop for Windows, bind mounts may fail on paths with spaces or Cyrillic characters. If your real path contains them, create an ASCII alias or junction first and mount that alias instead.
+
 ## What's Customized
 
 This workflow extends the original RLM-Toolkit with:
