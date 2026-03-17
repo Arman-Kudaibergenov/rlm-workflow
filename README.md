@@ -1,65 +1,53 @@
 # RLM Workflow for Claude Code
 
-> Persistent AI memory across sessions using RLM-Toolkit — customized workflow for Claude Code.
+RLM Workflow — это публичный workflow-слой вокруг `RLM-Toolkit` для сохранения контекста между сессиями Claude Code.
 
-**Основная документация на русском: [README.ru.md](README.ru.md)**
+## Документация
 
----
+- Русская документация: [README.ru.md](README.ru.md)
+- Installation: [docs/en/installation.md](docs/en/installation.md)
+- Workflow rituals: [docs/en/workflow.md](docs/en/workflow.md)
+- Hooks: [docs/en/hooks.md](docs/en/hooks.md)
+- LLM backends: [docs/en/llm-alternatives.md](docs/en/llm-alternatives.md)
+- Multi-agent mode: [docs/en/multi-agent.md](docs/en/multi-agent.md)
 
-## The Problem
+## Что это дает
 
-Every time Claude's context window fills up and you run `/compact` (or it happens automatically), you lose everything: decisions made, architecture discussed, tasks in progress. Next session — you start from scratch.
+- сохранение рабочих фактов и решений между сессиями
+- восстановление контекста после `/compact`
+- единый memory layer для нескольких агентов
+- project-scoped workflow поверх базового RLM
 
-**RLM solves this** by giving Claude a persistent external memory store that survives context clears and `/compact` events.
+## Быстрый старт
 
-## What Is RLM
-
-[RLM-Toolkit](https://github.com/DmitrL-dev/AISecurity/tree/main/rlm-toolkit) is an open-source memory layer for LLM agents, developed by [Dmitry Labintcev (DmitrL-dev)](https://github.com/DmitrL-dev). It implements hierarchical memory with causal decision tracking, semantic search, and enterprise-grade context management.
-
-This repository documents our **customized workflow** built on top of RLM-Toolkit for daily software development with Claude Code.
-
-### Original author's articles on Habr (Russian)
-- [Полное руководство по обработке 10M+ токенов](https://habr.com/ru/articles/986280/)
-- [Почему ваш LLM-агент забывает цель](https://habr.com/ru/articles/986836/)
-- [RLM-Toolkit v1.2.1: Теоретические основы](https://habr.com/ru/articles/986702/)
-- [RLM-Toolkit: Полная замена LangChain? FAQ часть 2](https://habr.com/ru/articles/987250/)
-
-## Quick Start (Docker)
+### Docker
 
 ```bash
-# Pull and run the RLM server
 docker run -d \
   --name rlm \
   -p 8200:8200 \
   -v rlm-data:/data \
   ghcr.io/arman-kudaibergenov/rlm-workflow:latest
-
-# Add to Claude Code MCP config (~/.claude/mcp.json)
-# See docs/en/installation.md for full configuration
-
-# REQUIRED: Copy CLAUDE.md template (rituals won't work without it)
-curl -o CLAUDE.md https://raw.githubusercontent.com/Arman-Kudaibergenov/rlm-workflow/master/examples/CLAUDE.md.example
-# Edit the [YOUR ...] sections for your project
 ```
 
-Or with Docker Compose:
+### Docker Compose
+
 ```bash
 curl -O https://raw.githubusercontent.com/Arman-Kudaibergenov/rlm-workflow/master/docker/docker-compose.yml
 cp docker/.env.example .env
-# Edit .env with your settings
 docker compose up -d
 ```
 
-## Docker volumes: what is required and what is optional
+## Volumes: что обязательно, а что нет
 
-There are two separate concerns:
+Есть две разные задачи:
 
-- Required for normal RLM operation: persistent data volume such as `rlm-data:/data`
-- Optional for project file discovery: an extra bind mount with your project files
+- обязательный volume для самой памяти RLM: `rlm-data:/data`
+- опциональный bind mount проекта, если вы хотите file-based discovery внутри контейнера
 
-RLM does not need your project source tree just to work as a memory server. The standard `-v rlm-data:/data` volume is enough for facts, indexes, and session continuity.
+Для обычной работы RLM как memory server достаточно только `rlm-data:/data`. Исходники проекта монтируются отдельно и только если вы хотите анализировать файловое дерево прямо из контейнера.
 
-If you want file-based project discovery from inside the container, add a second bind mount and point `RLM_PROJECT_ROOT` at it. Example:
+Пример:
 
 ```bash
 docker run -d \
@@ -71,55 +59,12 @@ docker run -d \
   ghcr.io/arman-kudaibergenov/rlm-workflow:latest
 ```
 
-### Windows note
+## Windows note
 
-On Docker Desktop for Windows, bind mounts may fail on paths with spaces or Cyrillic characters. If your real path contains them, create an ASCII alias or junction first and mount that alias instead.
+На Docker Desktop for Windows bind mount может ломаться на путях с пробелами или кириллицей. В таком случае сначала сделайте ASCII alias или junction и монтируйте уже его.
 
-## What's Customized
+## Attribution
 
-This workflow extends the original RLM-Toolkit with:
+Этот проект построен поверх [RLM-Toolkit](https://github.com/DmitrL-dev/AISecurity/tree/main/rlm-toolkit) Дмитрия Лабинцева. Базовая memory architecture, иерархические факты и causal decision tracking принадлежат исходному проекту. Наш слой — это workflow, упаковка и практический операционный контур.
 
-| Feature | Original | Our Workflow |
-|---------|----------|--------------|
-| Session continuity | Manual | Automated via pre-compact hook |
-| Context monitoring | None | Auto-save at 65% context usage |
-| Multi-agent memory | None | Shared RLM across agent teams |
-| Task tracking | None | PENDING facts with project scoping |
-| Autocapture | None | Automatic tool-use logging |
-
-See [CHANGELOG.md](CHANGELOG.md) for full list of customizations.
-
-## LLM Backend Options
-
-RLM-Toolkit can use various LLM backends for semantic search and embeddings:
-
-| Option | Hardware needed | Setup complexity |
-|--------|----------------|------------------|
-| OpenAI API | None (cloud) | Low — just API key |
-| Ollama + nomic-embed | CPU only | Medium |
-| Ollama + qwen3:8b | GPU recommended | Medium |
-| FastEmbed (built-in) | CPU only | Zero |
-
-See [docs/en/llm-alternatives.md](docs/en/llm-alternatives.md) for details.
-
-## Documentation
-
-- [Installation guide](docs/en/installation.md)
-- [Workflow rituals](docs/en/workflow.md) — the `summarize` / `context` / `new task` patterns
-- [Hooks setup](docs/en/hooks.md) — pre-compact and context-monitor automation
-- [LLM alternatives](docs/en/llm-alternatives.md)
-- [Multi-agent workflow](docs/en/multi-agent.md)
-
-## Credits & Attribution
-
-This project is a customization of **RLM-Toolkit** by [Dmitry Labintcev](https://github.com/DmitrL-dev).
-
-We took the original process and adapted it for our software development workflow. The core memory architecture, hierarchical facts, and causal decision tracking are from the original work.
-
-Full attribution: [CREDITS.md](CREDITS.md)
-
-## License
-
-This project is distributed under the [Apache License 2.0](LICENSE), same as the original RLM-Toolkit.
-
-Per Apache 2.0 requirements: the original copyright notice and NOTICE file are preserved. Our modifications are documented in [CHANGELOG.md](CHANGELOG.md).
+Подробности: [CREDITS.md](CREDITS.md), [CHANGELOG.md](CHANGELOG.md)
