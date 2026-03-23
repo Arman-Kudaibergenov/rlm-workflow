@@ -19,17 +19,19 @@ Always respond in [YOUR LANGUAGE].
 ## RLM Workflow Rituals
 
 ### "контекст" / "context"
-At session start, restore context from RLM:
+At session start, restore context from RLM.
+**Tip:** Start your message with a brief task description, then "контекст" on the next line — this way Claude Code creates a meaningful chat history title instead of just "контекст".
 
 1. Call `rlm_start_session(restore=true)`
 2. Call `rlm_enterprise_context` about current project and work status
 3. Call `rlm_search_facts` with `query="PENDING tasks next session", keyword_weight=0.8, semantic_weight=0.1, recency_weight=0.1, top_k=15`
    - Filter: show only facts without `[project:]` tag OR with `[project: current-project]`
    - Hide facts with `[project: other-project]`
-4. Output:
+4. If the task is tied to a specific domain, call `rlm_get_facts_by_domain(domain="<domain>")` for deeper context
+5. Output:
    - **Pending tasks** (from step 3) — numbered list, first
-   - **Recent decisions and key facts** (from step 2)
-5. If PENDING is non-empty → announce first task and start immediately
+   - **Recent decisions and key facts** (from steps 2, 4)
+6. If PENDING is non-empty → announce first task and start immediately
    Ask only if PENDING is empty or tasks need user clarification
 
 ---
@@ -41,7 +43,11 @@ End-of-session save ritual:
    - Group by Edit/Write → file change list; Bash → executed commands
    - After processing, clear buffer: `echo "" > ~/.claude/autocapture-buffer.jsonl`
 
-2. Save to RLM all important session content:
+2. Memory hygiene — clean before saving:
+   - Call `rlm_get_stale_facts()` — review and remove outdated facts
+   - If 5+ facts accumulated, call `rlm_consolidate_facts()` — aggregates L3→L2→L1, removes duplicates
+
+3. Save to RLM all important session content:
    - Completed work, file changes
    - Architectural decisions and their reasons
    - Current status of unfinished tasks
@@ -50,7 +56,7 @@ End-of-session save ritual:
    - Use `rlm_record_causal_decision` for decisions
    - Use `rlm_sync_state` at the end
 
-3. REQUIRED: Save PENDING fact:
+4. REQUIRED: Save PENDING fact:
    ```
    rlm_add_hierarchical_fact(
      content="PENDING tasks next session [task_id: <id>]: 1) <task1>. 2) <task2>.",
@@ -63,14 +69,14 @@ End-of-session save ritual:
    - Cross-project tasks → separate fact with `[project: project-name]`
    - If nothing pending: `PENDING tasks next session: none`
 
-4. Git: run `git status` and analyze:
+5. Git: run `git status` and analyze:
    - Commit if: changes are complete, logically coherent for this session
    - Add to PENDING if: WIP, needs more work next session
    - Skip if: no changes
 
-5. Report what was saved and git status
+6. Report what was saved and git status
 
-6. Tell user to run `/clear`
+7. Tell user to run `/clear`
 
 ---
 
@@ -88,6 +94,21 @@ New task initialization:
    )
    ```
 5. For complex tasks: create team, spawn agents with mandatory RLM block
+
+---
+
+## H-MEM Levels Reference
+
+When using `rlm_add_hierarchical_fact`, pass the `level` parameter (0–3):
+
+| `level` | Name | When to use |
+|---------|------|-------------|
+| `0` | `L0_PROJECT` | Always loaded — critical global knowledge, project pitfalls |
+| `1` | `L1_DOMAIN` | Loaded by context — PENDING tasks, session decisions, workflow facts |
+| `2` | `L2_MODULE` | Loaded on demand — implementation details, configs, specific findings |
+| `3` | `L3_CODE` | Temporary — code-level notes, debugging details (auto-consolidated) |
+
+Higher levels consolidate into lower levels over time via `rlm_consolidate_facts()`.
 
 ---
 

@@ -19,6 +19,9 @@ services:
       - RLM_HOST=0.0.0.0
       - RLM_PORT=8200
       - RLM_TRANSPORT=${RLM_TRANSPORT:-sse}
+      # Embedding model — default: all-MiniLM-L6-v2 (English-optimized)
+      # For multilingual (Russian, etc.): paraphrase-multilingual-MiniLM-L12-v2
+      - RLM_EMBEDDING_MODEL=${RLM_EMBEDDING_MODEL:-}
       - OPENAI_API_KEY=${OPENAI_API_KEY:-}
       - OLLAMA_BASE_URL=${OLLAMA_BASE_URL:-}
     deploy:
@@ -29,4 +32,8 @@ services:
 
 volumes:
   rlm-data:
+    # Note: if migrating from `docker run` to compose, you may need:
+    #   external: true
+    # to reuse the existing `rlm-data` volume created by `docker run`.
+    # Without this, compose creates a project-prefixed volume (e.g., `rlm_rlm-data`).
     driver: local

@@ -6,10 +6,13 @@ HOST="${RLM_HOST:-0.0.0.0}"
 PORT="${RLM_PORT:-8200}"
 TRANSPORT="${RLM_TRANSPORT:-sse}"
 
+EMBEDDING="${RLM_EMBEDDING_MODEL:-all-MiniLM-L6-v2 (default)}"
+
 echo "Starting RLM-Toolkit MCP server"
 echo "  Data dir:  $DATA_DIR"
 echo "  Listen:    $HOST:$PORT"
 echo "  Transport: $TRANSPORT"
+echo "  Embedding: $EMBEDDING"
 
 mkdir -p "$DATA_DIR"
 

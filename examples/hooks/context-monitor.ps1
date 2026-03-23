@@ -18,16 +18,17 @@ try {
     $inputData = [Console]::In.ReadToEnd()
     if ([string]::IsNullOrWhiteSpace($inputData)) { exit 0 }
 
-    $event = $inputData | ConvertFrom-Json -ErrorAction Stop
-    $sessionId = $event.session_id
+    $toolEvent = $inputData | ConvertFrom-Json -ErrorAction Stop
+    $sessionId = $toolEvent.session_id
     if ([string]::IsNullOrWhiteSpace($sessionId)) { exit 0 }
 
     # Read context state written by statusline on every turn
     $ctxFile = "$env:TEMP\claude-ctx-state.json"
     if (-not (Test-Path $ctxFile)) { exit 0 }
 
+    $staleSec = if ($env:RLM_CTX_STALE_SEC) { [int]$env:RLM_CTX_STALE_SEC } else { 3600 }
     $fileAge = ((Get-Date) - (Get-Item $ctxFile).LastWriteTime).TotalSeconds
-    if ($fileAge -gt 300) { exit 0 }  # stale > 5 min, skip
+    if ($fileAge -gt $staleSec) { exit 0 }  # stale, skip
 
     $ctx = Get-Content $ctxFile -Raw | ConvertFrom-Json
     $pct = [int]$ctx.pct
