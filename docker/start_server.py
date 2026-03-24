@@ -257,17 +257,40 @@ class _FileWatcherFilter(logging.Filter):
         return "FileWatcher started" not in record.getMessage()
 
 
-def _filter_tools(server):
-    """Filter MCP tools to only those listed in RLM_TOOLS env var.
+# Default tool set — the tools people actually use.
+# Set RLM_TOOLS=all to get everything, or comma-separated list to customize.
+_DEFAULT_TOOLS = {
+    "rlm_start_session",
+    "rlm_search_facts",
+    "rlm_add_hierarchical_fact",
+    "rlm_route_context",
+    "rlm_get_hierarchy_stats",
+    "rlm_record_causal_decision",
+    "rlm_delete_fact",
+    "rlm_consolidate_facts",
+    "rlm_get_stale_facts",
+    "rlm_sync_state",
+    "rlm_discover_project",
+    "rlm_enterprise_context",
+}
 
-    RLM_TOOLS="rlm_search_facts,rlm_add_hierarchical_fact,rlm_route_context"
-    If not set or empty, all tools remain (backward compatible).
+
+def _filter_tools(server):
+    """Filter MCP tools to a curated default set.
+
+    Default: 12 essential tools (memory, search, routing, governance).
+    RLM_TOOLS=all → keep all tools (no filtering).
+    RLM_TOOLS=tool1,tool2 → custom whitelist.
     """
     tools_env = os.environ.get("RLM_TOOLS", "").strip()
-    if not tools_env:
+
+    if tools_env.lower() == "all":
+        print("  Tools: all (RLM_TOOLS=all)")
         return
 
-    allowed = {t.strip() for t in tools_env.split(",") if t.strip()}
+    allowed = _DEFAULT_TOOLS
+    if tools_env:
+        allowed = {t.strip() for t in tools_env.split(",") if t.strip()}
 
     # MCP server stores tool handlers internally
     handlers = getattr(server.mcp, "_tool_handlers", None)
@@ -280,7 +303,7 @@ def _filter_tools(server):
     for name in to_remove:
         del handlers[name]
 
-    print(f"  Tools: {before} → {len(handlers)} (filtered by RLM_TOOLS)")
+    print(f"  Tools: {before} → {len(handlers)} (default set)")
 
 
 def main():
