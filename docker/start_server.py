@@ -229,8 +229,12 @@ def _patch_embedding(server):
         import sys
 
         print(f"  ERROR: Embedding override failed for '{model_name}': {e}")
-        print(f"  Falling back to default all-MiniLM-L6-v2")
         print(f"  ERROR: RLM_EMBEDDING_MODEL={model_name} failed", file=sys.stderr)
+        strict = os.environ.get("RLM_EMBEDDING_STRICT", "").lower() in ("true", "1", "yes")
+        if strict:
+            print(f"  FATAL: RLM_EMBEDDING_STRICT=true — refusing to start with wrong model")
+            sys.exit(1)
+        print(f"  WARNING: Falling back to default all-MiniLM-L6-v2")
 
 
 def _suppress_misleading_logs():
@@ -251,6 +255,32 @@ class _FileWatcherFilter(logging.Filter):
 
     def filter(self, record):
         return "FileWatcher started" not in record.getMessage()
+
+
+def _filter_tools(server):
+    """Filter MCP tools to only those listed in RLM_TOOLS env var.
+
+    RLM_TOOLS="rlm_search_facts,rlm_add_hierarchical_fact,rlm_route_context"
+    If not set or empty, all tools remain (backward compatible).
+    """
+    tools_env = os.environ.get("RLM_TOOLS", "").strip()
+    if not tools_env:
+        return
+
+    allowed = {t.strip() for t in tools_env.split(",") if t.strip()}
+
+    # MCP server stores tool handlers internally
+    handlers = getattr(server.mcp, "_tool_handlers", None)
+    if handlers is None:
+        print("  WARNING: Cannot filter tools — _tool_handlers not found on this MCP version")
+        return
+
+    before = len(handlers)
+    to_remove = [name for name in handlers if name not in allowed]
+    for name in to_remove:
+        del handlers[name]
+
+    print(f"  Tools: {before} → {len(handlers)} (filtered by RLM_TOOLS)")
 
 
 def main():
@@ -275,6 +305,9 @@ def main():
 
     # Apply embedding override AFTER creating server (instance-level patch)
     _patch_embedding(server)
+
+    # Filter tools to allowed set (if RLM_TOOLS env var is set)
+    _filter_tools(server)
 
     server.mcp.settings.host = args.host
     server.mcp.settings.port = args.port

@@ -21,6 +21,8 @@ VOLUME ["/data"]
 EXPOSE 8200
 
 HEALTHCHECK --interval=30s --timeout=10s --start-period=60s --retries=3 \
-  CMD python -c "import os,urllib.request; t=os.environ.get('RLM_TRANSPORT','sse'); p='/mcp' if t=='streamable-http' else '/'+t; urllib.request.urlopen(f'http://localhost:8200{p}')" || exit 1
+  CMD python /app/healthcheck.py || exit 1
+
+COPY healthcheck.py /app/healthcheck.py
 
 ENTRYPOINT ["/app/entrypoint.sh"]

@@ -25,6 +25,10 @@ services:
       - RLM_EMBEDDING_PROVIDER=${RLM_EMBEDDING_PROVIDER:-}
       - OLLAMA_BASE_URL=${OLLAMA_BASE_URL:-}
       - OPENAI_API_KEY=${OPENAI_API_KEY:-}
+      # Strict mode: exit on embedding failure instead of falling back to default
+      - RLM_EMBEDDING_STRICT=${RLM_EMBEDDING_STRICT:-}
+      # Tool whitelist: comma-separated tool names. Empty = all tools (default)
+      - RLM_TOOLS=${RLM_TOOLS:-}
     deploy:
       resources:
         limits:
