@@ -35,6 +35,8 @@ OPENAI_API_KEY=sk-...
 RLM_EMBEDDING_MODEL=text-embedding-3-small
 ```
 
+Available models: `text-embedding-3-small` (1536d, cheapest), `text-embedding-3-large` (3072d, best), `text-embedding-ada-002` (1536d, legacy).
+
 **Use this if**: you use OpenAI anyway, want cloud convenience, no local hardware.
 
 ---

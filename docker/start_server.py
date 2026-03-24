@@ -110,12 +110,64 @@ class OllamaEmbedder:
         return self._dim
 
 
+class OpenAIEmbedder:
+    """Embedding via OpenAI API. Supports text-embedding-3-small/large, text-embedding-ada-002."""
+
+    # Static dimension lookup — avoids paid API call for dimension probe
+    _KNOWN_DIMS = {
+        "text-embedding-3-small": 1536,
+        "text-embedding-3-large": 3072,
+        "text-embedding-ada-002": 1536,
+    }
+
+    def __init__(self, model_name: str, api_key: str):
+        self._model_name = model_name
+        self._api_key = api_key
+        self._dim = self._KNOWN_DIMS.get(model_name)
+
+    def encode(self, sentences, **kwargs):
+        import json
+        import urllib.request
+
+        import numpy as np
+
+        if isinstance(sentences, str):
+            sentences = [sentences]
+
+        url = "https://api.openai.com/v1/embeddings"
+        payload = json.dumps({"model": self._model_name, "input": sentences}).encode()
+        req = urllib.request.Request(url, data=payload, headers={
+            "Content-Type": "application/json",
+            "Authorization": f"Bearer {self._api_key}",
+        })
+        with urllib.request.urlopen(req, timeout=30) as resp:
+            data = json.loads(resp.read())
+
+        # Sort by index — OpenAI may return items out of order in batch calls
+        items = sorted(data["data"], key=lambda x: x["index"])
+        embeddings = [item["embedding"] for item in items]
+        if not self._dim and embeddings:
+            self._dim = len(embeddings[0])
+        if len(embeddings) > 1:
+            return np.array(embeddings, dtype=np.float32)
+        return np.array(embeddings[0], dtype=np.float32) if embeddings else np.array([])
+
+    def get_sentence_embedding_dimension(self):
+        if not self._dim:
+            self.encode("dimension probe")
+        return self._dim
+
+
 def _create_embedder(model_name: str):
     """Create embedder based on RLM_EMBEDDING_PROVIDER env var.
 
     Supports:
     - "ollama": uses Ollama HTTP API (requires OLLAMA_BASE_URL)
+    - "openai": uses OpenAI API (requires OPENAI_API_KEY)
     - default: uses SentenceTransformer (HuggingFace models)
+
+    No Float32SafeEmbedder needed for Ollama/OpenAI — they return numpy arrays
+    directly, and upstream calls .tolist() which works on numpy natively.
     """
     provider = os.environ.get("RLM_EMBEDDING_PROVIDER", "").lower()
 
@@ -124,6 +176,16 @@ def _create_embedder(model_name: str):
         embedder = OllamaEmbedder(model_name, base_url)
         dim = embedder.get_sentence_embedding_dimension()
         print(f"  Embedding: {model_name} via Ollama at {base_url} (dim={dim})")
+        return embedder, dim
+
+    if provider == "openai":
+        api_key = os.environ.get("OPENAI_API_KEY", "")
+        if not api_key:
+            raise ValueError("RLM_EMBEDDING_PROVIDER=openai but OPENAI_API_KEY not set")
+        effective_model = model_name or "text-embedding-3-small"
+        embedder = OpenAIEmbedder(effective_model, api_key)
+        dim = embedder.get_sentence_embedding_dimension()
+        print(f"  Embedding: {effective_model} via OpenAI API (dim={dim})")
         return embedder, dim
 
     # Default: SentenceTransformer (HuggingFace)
