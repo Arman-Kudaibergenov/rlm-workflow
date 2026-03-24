@@ -19,15 +19,17 @@ services:
       - RLM_HOST=0.0.0.0
       - RLM_PORT=8200
       - RLM_TRANSPORT=${RLM_TRANSPORT:-sse}
-      # Embedding model — default: all-MiniLM-L6-v2 (English-optimized)
-      # For multilingual (Russian, etc.): paraphrase-multilingual-MiniLM-L12-v2
+      # Embedding: default = paraphrase-multilingual-MiniLM-L12-v2 (multilingual, CPU)
+      # For Ollama GPU: RLM_EMBEDDING_PROVIDER=ollama, OLLAMA_BASE_URL, RLM_EMBEDDING_MODEL
+      # For OpenAI/LM Studio: RLM_EMBEDDING_PROVIDER=openai, OPENAI_API_KEY or OPENAI_API_BASE
       - RLM_EMBEDDING_MODEL=${RLM_EMBEDDING_MODEL:-}
       - RLM_EMBEDDING_PROVIDER=${RLM_EMBEDDING_PROVIDER:-}
       - OLLAMA_BASE_URL=${OLLAMA_BASE_URL:-}
       - OPENAI_API_KEY=${OPENAI_API_KEY:-}
-      # Strict mode: exit on embedding failure instead of falling back to default
+      - OPENAI_API_BASE=${OPENAI_API_BASE:-}
+      # Strict mode: exit on embedding failure instead of falling back
       - RLM_EMBEDDING_STRICT=${RLM_EMBEDDING_STRICT:-}
-      # Tool whitelist: comma-separated tool names. Empty = all tools (default)
+      # Tools: default = 12 essential tools. Set RLM_TOOLS=all for everything
       - RLM_TOOLS=${RLM_TOOLS:-}
     deploy:
       resources:

@@ -111,7 +111,11 @@ class OllamaEmbedder:
 
 
 class OpenAIEmbedder:
-    """Embedding via OpenAI API. Supports text-embedding-3-small/large, text-embedding-ada-002."""
+    """Embedding via OpenAI-compatible API.
+
+    Works with: OpenAI, LM Studio, LocalAI, vLLM, text-generation-inference.
+    Set OPENAI_API_BASE for non-OpenAI endpoints (e.g. http://localhost:1234/v1).
+    """
 
     # Static dimension lookup — avoids paid API call for dimension probe
     _KNOWN_DIMS = {
@@ -120,9 +124,10 @@ class OpenAIEmbedder:
         "text-embedding-ada-002": 1536,
     }
 
-    def __init__(self, model_name: str, api_key: str):
+    def __init__(self, model_name: str, api_key: str, base_url: str = ""):
         self._model_name = model_name
         self._api_key = api_key
+        self._base_url = base_url.rstrip("/") if base_url else "https://api.openai.com/v1"
         self._dim = self._KNOWN_DIMS.get(model_name)
 
     def encode(self, sentences, **kwargs):
@@ -134,7 +139,7 @@ class OpenAIEmbedder:
         if isinstance(sentences, str):
             sentences = [sentences]
 
-        url = "https://api.openai.com/v1/embeddings"
+        url = f"{self._base_url}/embeddings"
         payload = json.dumps({"model": self._model_name, "input": sentences}).encode()
         req = urllib.request.Request(url, data=payload, headers={
             "Content-Type": "application/json",
@@ -180,12 +185,14 @@ def _create_embedder(model_name: str):
 
     if provider == "openai":
         api_key = os.environ.get("OPENAI_API_KEY", "")
-        if not api_key:
+        base_url = os.environ.get("OPENAI_API_BASE", "")
+        if not api_key and not base_url:
             raise ValueError("RLM_EMBEDDING_PROVIDER=openai but OPENAI_API_KEY not set")
         effective_model = model_name or "text-embedding-3-small"
-        embedder = OpenAIEmbedder(effective_model, api_key)
+        embedder = OpenAIEmbedder(effective_model, api_key, base_url)
         dim = embedder.get_sentence_embedding_dimension()
-        print(f"  Embedding: {effective_model} via OpenAI API (dim={dim})")
+        target = base_url or "OpenAI API"
+        print(f"  Embedding: {effective_model} via {target} (dim={dim})")
         return embedder, dim
 
     # Default: SentenceTransformer (HuggingFace)
@@ -209,7 +216,7 @@ def _patch_embedding(server):
     """
     model_name = os.environ.get("RLM_EMBEDDING_MODEL", "")
     if not model_name:
-        print("  Embedding: all-MiniLM-L6-v2 (default)")
+        print("  Embedding: upstream default (no RLM_EMBEDDING_MODEL set)")
         return
 
     try:
@@ -234,7 +241,7 @@ def _patch_embedding(server):
         if strict:
             print(f"  FATAL: RLM_EMBEDDING_STRICT=true — refusing to start with wrong model")
             sys.exit(1)
-        print(f"  WARNING: Falling back to default all-MiniLM-L6-v2")
+        print(f"  WARNING: Falling back to upstream default embedding")
 
 
 def _suppress_misleading_logs():

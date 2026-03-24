@@ -6,7 +6,9 @@ HOST="${RLM_HOST:-0.0.0.0}"
 PORT="${RLM_PORT:-8200}"
 TRANSPORT="${RLM_TRANSPORT:-sse}"
 
-EMBEDDING="${RLM_EMBEDDING_MODEL:-all-MiniLM-L6-v2 (default)}"
+# Default to multilingual model (supports Russian, English, etc.)
+export RLM_EMBEDDING_MODEL="${RLM_EMBEDDING_MODEL:-paraphrase-multilingual-MiniLM-L12-v2}"
+EMBEDDING="$RLM_EMBEDDING_MODEL"
 
 echo "Starting RLM-Toolkit MCP server"
 echo "  Data dir:  $DATA_DIR"
