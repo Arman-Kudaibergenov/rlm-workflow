@@ -84,6 +84,8 @@ class OllamaEmbedder:
         import json
         import urllib.request
 
+        import numpy as np
+
         if isinstance(sentences, str):
             sentences = [sentences]
 
@@ -96,7 +98,10 @@ class OllamaEmbedder:
         embeddings = data.get("embeddings", [])
         if not self._dim and embeddings:
             self._dim = len(embeddings[0])
-        return embeddings if len(embeddings) > 1 else embeddings[0]
+        # Return numpy arrays — upstream code calls .tolist() on results
+        if len(embeddings) > 1:
+            return np.array(embeddings, dtype=np.float32)
+        return np.array(embeddings[0], dtype=np.float32) if embeddings else np.array([])
 
     def get_sentence_embedding_dimension(self):
         if not self._dim:
@@ -212,9 +217,8 @@ def main():
     server.mcp.settings.host = args.host
     server.mcp.settings.port = args.port
 
-    # Allow connections from any host (container is network-exposed, not localhost-only)
-    if server.mcp.settings.transport_security:
-        server.mcp.settings.transport_security.allowed_hosts = ["*"]
+    # Disable host validation — container is network-exposed, not localhost-only
+    server.mcp.settings.transport_security = None
 
     server.mcp.run(transport=args.transport)
 
