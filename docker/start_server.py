@@ -72,13 +72,73 @@ def _patch_session_restore():
     MemoryBridgeManager.start_session = _patched
 
 
+class OllamaEmbedder:
+    """Embedding via Ollama HTTP API. Supports models like nomic-embed-text:latest."""
+
+    def __init__(self, model_name: str, base_url: str):
+        self._model_name = model_name
+        self._base_url = base_url.rstrip("/")
+        self._dim = None
+
+    def encode(self, sentences, **kwargs):
+        import json
+        import urllib.request
+
+        if isinstance(sentences, str):
+            sentences = [sentences]
+
+        url = f"{self._base_url}/api/embed"
+        payload = json.dumps({"model": self._model_name, "input": sentences}).encode()
+        req = urllib.request.Request(url, data=payload, headers={"Content-Type": "application/json"})
+        with urllib.request.urlopen(req, timeout=30) as resp:
+            data = json.loads(resp.read())
+
+        embeddings = data.get("embeddings", [])
+        if not self._dim and embeddings:
+            self._dim = len(embeddings[0])
+        return embeddings if len(embeddings) > 1 else embeddings[0]
+
+    def get_sentence_embedding_dimension(self):
+        if not self._dim:
+            # Probe with a test sentence
+            self.encode("dimension probe")
+        return self._dim
+
+
+def _create_embedder(model_name: str):
+    """Create embedder based on RLM_EMBEDDING_PROVIDER env var.
+
+    Supports:
+    - "ollama": uses Ollama HTTP API (requires OLLAMA_BASE_URL)
+    - default: uses SentenceTransformer (HuggingFace models)
+    """
+    provider = os.environ.get("RLM_EMBEDDING_PROVIDER", "").lower()
+
+    if provider == "ollama":
+        base_url = os.environ.get("OLLAMA_BASE_URL", "http://localhost:11434")
+        embedder = OllamaEmbedder(model_name, base_url)
+        dim = embedder.get_sentence_embedding_dimension()
+        print(f"  Embedding: {model_name} via Ollama at {base_url} (dim={dim})")
+        return embedder, dim
+
+    # Default: SentenceTransformer (HuggingFace)
+    from sentence_transformers import SentenceTransformer
+
+    raw_embedder = SentenceTransformer(model_name)
+    dim = raw_embedder.get_sentence_embedding_dimension()
+    # Wrap for JSON safety (#13) — convert numpy float32 → Python float
+    embedder = Float32SafeEmbedder(raw_embedder)
+    print(f"  Embedding: {model_name} (dim={dim}, from RLM_EMBEDDING_MODEL)")
+    return embedder, dim
+
+
 def _patch_embedding(server):
     """Override embedding model from RLM_EMBEDDING_MODEL env var.
 
     Fixes GitHub issues #5, #4, #13, #16:
     - Wraps SentenceTransformer in Float32SafeEmbedder for JSON-safe output (#13)
+    - Supports Ollama via HTTP API (RLM_EMBEDDING_PROVIDER=ollama)
     - Single embedder instance reused for both store and router (#16)
-    - Patches both HierarchicalMemoryStore and SemanticRouter's EmbeddingService
     """
     model_name = os.environ.get("RLM_EMBEDDING_MODEL", "")
     if not model_name:
@@ -86,13 +146,7 @@ def _patch_embedding(server):
         return
 
     try:
-        from sentence_transformers import SentenceTransformer
-
-        raw_embedder = SentenceTransformer(model_name)
-        dim = raw_embedder.get_sentence_embedding_dimension()
-
-        # Wrap for JSON safety (#13) — convert numpy float32 → Python float
-        embedder = Float32SafeEmbedder(raw_embedder)
+        embedder, dim = _create_embedder(model_name)
 
         # Patch store embedder — single instance (#16)
         server.memory_bridge_v2_store.set_embedder(embedder)
@@ -101,11 +155,9 @@ def _patch_embedding(server):
         components = getattr(server, "memory_bridge_v2_components", {})
         router = components.get("router")
         if router and hasattr(router, "embedding_service"):
-            # Replace EmbeddingService's internal model with our wrapped embedder
             router.embedding_service._model = embedder
             router.embedding_service._model_name = model_name
 
-        print(f"  Embedding: {model_name} (dim={dim}, from RLM_EMBEDDING_MODEL)")
     except Exception as e:
         import sys
 
@@ -159,6 +211,11 @@ def main():
 
     server.mcp.settings.host = args.host
     server.mcp.settings.port = args.port
+
+    # Allow connections from any host (container is network-exposed, not localhost-only)
+    if server.mcp.settings.transport_security:
+        server.mcp.settings.transport_security.allowed_hosts = ["*"]
+
     server.mcp.run(transport=args.transport)
 
 

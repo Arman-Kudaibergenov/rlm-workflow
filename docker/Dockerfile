@@ -2,8 +2,10 @@ FROM python:3.12-slim
 
 WORKDIR /app
 
-# Install RLM-Toolkit with all extras (fastembed default — CPU, no API keys)
+# Install CPU-only PyTorch first (avoids 2GB+ CUDA download), then RLM-Toolkit
 RUN pip install --no-cache-dir \
+    torch --index-url https://download.pytorch.org/whl/cpu && \
+    pip install --no-cache-dir \
     "rlm-toolkit[all]==2.3.1"
 
 # Data directory for persistent storage
