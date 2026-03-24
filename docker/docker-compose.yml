@@ -23,7 +23,6 @@ services:
       # For multilingual (Russian, etc.): paraphrase-multilingual-MiniLM-L12-v2
       - RLM_EMBEDDING_MODEL=${RLM_EMBEDDING_MODEL:-}
       - OPENAI_API_KEY=${OPENAI_API_KEY:-}
-      - OLLAMA_BASE_URL=${OLLAMA_BASE_URL:-}
     deploy:
       resources:
         limits:

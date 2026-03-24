@@ -17,7 +17,8 @@ echo "  Embedding: $EMBEDDING"
 mkdir -p "$DATA_DIR"
 
 # RLM-Toolkit reads RLM_PROJECT_ROOT for storage location
-export RLM_PROJECT_ROOT="$DATA_DIR"
+# Respect user-provided value (e.g., /workspace bind mount); fallback to DATA_DIR (#14)
+export RLM_PROJECT_ROOT="${RLM_PROJECT_ROOT:-$DATA_DIR}"
 
 exec python /app/start_server.py \
     --host "$HOST" \

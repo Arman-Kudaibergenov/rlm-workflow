@@ -1,28 +1,64 @@
 """Thin wrapper to launch rlm-toolkit MCP server with configurable transport and bind address.
 
 Applies monkey-patches for:
+- #13: Float32SafeEmbedder wrapper for numpy→Python float conversion
 - #5/#4: Embedding model override from RLM_EMBEDDING_MODEL env var
-- #8/#7: Session restore fallback to "default" or most recent session
+- #8/#7/#18: Session restore — "default" session only, no fallback to latest
+- #16: Single embedder instance reused across store and router
+- #17: Suppress misleading FileWatcher log from upstream
 """
 
 import argparse
+import logging
 import os
 
 
-def _patch_session_restore():
-    """Patch MemoryBridgeManager.start_session to restore last session when session_id=None.
+class Float32SafeEmbedder:
+    """Wraps SentenceTransformer to convert numpy float32 → Python float for JSON safety.
 
-    Fixes GitHub issues #8 and #7: without this patch, restore=True with session_id=None
-    generates a random UUID, tries to load it (fails), and creates an empty session.
+    Fixes GitHub issue #13: rlm-toolkit serializes embeddings to JSON, but numpy.float32
+    is not JSON-serializable. This wrapper intercepts encode() output and converts to native
+    Python floats via .tolist().
     """
-    from rlm_toolkit.memory_bridge.manager import MemoryBridgeManager
+
+    def __init__(self, model):
+        self._model = model
+
+    def encode(self, sentences, **kwargs):
+        result = self._model.encode(sentences, **kwargs)
+        if hasattr(result, "tolist"):
+            return result.tolist()
+        # Handle edge case: list of numpy arrays
+        if isinstance(result, list):
+            import numpy as np
+
+            return [r.tolist() if isinstance(r, np.ndarray) else r for r in result]
+        return result
+
+    def get_sentence_embedding_dimension(self):
+        return self._model.get_sentence_embedding_dimension()
+
+    def __getattr__(self, name):
+        return getattr(self._model, name)
+
+
+def _patch_session_restore():
+    """Patch MemoryBridgeManager.start_session to restore "default" session when session_id=None.
+
+    Fixes GitHub issues #8, #7, #18: without this patch, restore=True with session_id=None
+    either generates a random UUID (empty session) or falls back to latest session (isolation risk).
+
+    Now: only restores named "default" session. If absent, creates new session via upstream.
+    """
     from datetime import datetime
+
+    from rlm_toolkit.memory_bridge.manager import MemoryBridgeManager
 
     _original = MemoryBridgeManager.start_session
 
     def _patched(self, session_id=None, restore=True):
         if restore and session_id is None:
-            # Try "default" session first
+            # Only restore named "default" session — no fallback to latest (isolation, #18)
             state = self.storage.load_state("default")
             if state:
                 state.version += 1
@@ -30,18 +66,7 @@ def _patch_session_restore():
                 self._current_state = state
                 print(f"  Session restored: 'default' (v{state.version})")
                 return state
-            # Else try most recent session from storage (already sorted DESC by last_updated)
-            if hasattr(self.storage, "list_sessions"):
-                sessions = self.storage.list_sessions()
-                if sessions:
-                    latest_id = sessions[0]["session_id"]
-                    state = self.storage.load_state(latest_id)
-                    if state:
-                        state.version += 1
-                        state.timestamp = datetime.now()
-                        self._current_state = state
-                        print(f"  Session restored: '{latest_id}' (v{state.version})")
-                        return state
+            print("  No 'default' session found — creating new session")
         return _original(self, session_id=session_id, restore=restore)
 
     MemoryBridgeManager.start_session = _patched
@@ -50,11 +75,10 @@ def _patch_session_restore():
 def _patch_embedding(server):
     """Override embedding model from RLM_EMBEDDING_MODEL env var.
 
-    Fixes GitHub issues #5 and #4: rlm-toolkit hardcodes all-MiniLM-L6-v2,
-    ignoring RLM_EMBEDDING_MODEL env var.
-
-    Patches both HierarchicalMemoryStore embedder AND SemanticRouter's EmbeddingService
-    to avoid dimension mismatch between stored embeddings and search queries.
+    Fixes GitHub issues #5, #4, #13, #16:
+    - Wraps SentenceTransformer in Float32SafeEmbedder for JSON-safe output (#13)
+    - Single embedder instance reused for both store and router (#16)
+    - Patches both HierarchicalMemoryStore and SemanticRouter's EmbeddingService
     """
     model_name = os.environ.get("RLM_EMBEDDING_MODEL", "")
     if not model_name:
@@ -63,28 +87,51 @@ def _patch_embedding(server):
 
     try:
         from sentence_transformers import SentenceTransformer
-        from rlm_toolkit.memory_bridge.v2.embeddings import EmbeddingService
 
-        embedder = SentenceTransformer(model_name)
-        dim = embedder.get_sentence_embedding_dimension()
+        raw_embedder = SentenceTransformer(model_name)
+        dim = raw_embedder.get_sentence_embedding_dimension()
 
-        # Patch store embedder
+        # Wrap for JSON safety (#13) — convert numpy float32 → Python float
+        embedder = Float32SafeEmbedder(raw_embedder)
+
+        # Patch store embedder — single instance (#16)
         server.memory_bridge_v2_store.set_embedder(embedder)
 
-        # Patch router's EmbeddingService to use same model
+        # Patch router to reuse same embedder (#16) — avoid loading a third model instance
         components = getattr(server, "memory_bridge_v2_components", {})
         router = components.get("router")
-        if router:
-            router.embedding_service = EmbeddingService(model_name=model_name)
-            # Force model load so it's ready
-            _ = router.embedding_service.model
+        if router and hasattr(router, "embedding_service"):
+            # Replace EmbeddingService's internal model with our wrapped embedder
+            router.embedding_service._model = embedder
+            router.embedding_service._model_name = model_name
 
         print(f"  Embedding: {model_name} (dim={dim}, from RLM_EMBEDDING_MODEL)")
     except Exception as e:
+        import sys
+
         print(f"  ERROR: Embedding override failed for '{model_name}': {e}")
         print(f"  Falling back to default all-MiniLM-L6-v2")
-        import sys
         print(f"  ERROR: RLM_EMBEDDING_MODEL={model_name} failed", file=sys.stderr)
+
+
+def _suppress_misleading_logs():
+    """Suppress misleading 'FileWatcher started' from upstream when watchdog not installed.
+
+    Fixes GitHub issue #17: upstream logs success regardless of start_file_watcher() return value.
+    """
+    import logging
+
+    # Target ALL upstream loggers that may emit the misleading message
+    for logger_name in ("rlm_mcp", "rlm_toolkit.mcp.server", "rlm_toolkit.mcp"):
+        logger = logging.getLogger(logger_name)
+        logger.addFilter(_FileWatcherFilter())
+
+
+class _FileWatcherFilter(logging.Filter):
+    """Filter out only the misleading 'FileWatcher started' message, keep everything else."""
+
+    def filter(self, record):
+        return "FileWatcher started" not in record.getMessage()
 
 
 def main():
@@ -96,6 +143,9 @@ def main():
 
     # Ensure RLM_PROJECT_ROOT is set before import (ContextManager reads it at init)
     os.environ.setdefault("RLM_PROJECT_ROOT", "/data")
+
+    # Suppress misleading upstream logs (#17) — before server creation
+    _suppress_misleading_logs()
 
     # Apply session restore patch BEFORE creating server (class-level patch)
     _patch_session_restore()
