@@ -356,16 +356,15 @@ def _filter_tools(server):
         print(f"  Tools: {before} → {len(handlers)} (default set)")
         return
 
-    # v2+: use list_tools/remove_tool API
+    # v2+: _tool_manager._tools is a dict
     tool_manager = getattr(server.mcp, "_tool_manager", None)
-    if tool_manager is not None:
-        all_tools = server.mcp.list_tools()
-        before = len(all_tools)
-        for tool in all_tools:
-            if tool.name not in allowed:
-                server.mcp.remove_tool(tool.name)
-        after = len(server.mcp.list_tools())
-        print(f"  Tools: {before} → {after} (default set)")
+    if tool_manager is not None and hasattr(tool_manager, "_tools"):
+        tools_dict = tool_manager._tools
+        before = len(tools_dict)
+        to_remove = [name for name in tools_dict if name not in allowed]
+        for name in to_remove:
+            del tools_dict[name]
+        print(f"  Tools: {before} → {len(tools_dict)} (default set)")
         return
 
     print("  WARNING: Cannot filter tools — no known tool storage found")
