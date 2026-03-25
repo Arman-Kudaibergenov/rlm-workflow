@@ -4,7 +4,7 @@ set -e
 DATA_DIR="${RLM_DATA_DIR:-/data}"
 HOST="${RLM_HOST:-0.0.0.0}"
 PORT="${RLM_PORT:-8200}"
-TRANSPORT="${RLM_TRANSPORT:-sse}"
+TRANSPORT="${RLM_TRANSPORT:-streamable-http}"
 
 # Default to multilingual model (supports Russian, English, etc.)
 export RLM_EMBEDDING_MODEL="${RLM_EMBEDDING_MODEL:-paraphrase-multilingual-MiniLM-L12-v2}"

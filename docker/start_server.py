@@ -14,25 +14,25 @@ import os
 
 
 class Float32SafeEmbedder:
-    """Wraps SentenceTransformer to convert numpy float32 → Python float for JSON safety.
+    """Wraps embedders to convert numpy float32 → float64 for JSON safety.
 
     Fixes GitHub issue #13: rlm-toolkit serializes embeddings to JSON, but numpy.float32
-    is not JSON-serializable. This wrapper intercepts encode() output and converts to native
-    Python floats via .tolist().
+    is not JSON-serializable. This wrapper intercepts encode() output and converts to float64
+    (JSON-serializable) while keeping numpy array structure (upstream may call .tolist()).
     """
 
     def __init__(self, model):
         self._model = model
 
     def encode(self, sentences, **kwargs):
+        import numpy as np
+
         result = self._model.encode(sentences, **kwargs)
-        if hasattr(result, "tolist"):
-            return result.tolist()
+        if isinstance(result, np.ndarray):
+            return result.astype(np.float64)
         # Handle edge case: list of numpy arrays
         if isinstance(result, list):
-            import numpy as np
-
-            return [r.tolist() if isinstance(r, np.ndarray) else r for r in result]
+            return [r.astype(np.float64) if isinstance(r, np.ndarray) else r for r in result]
         return result
 
     def get_sentence_embedding_dimension(self):
@@ -171,15 +171,17 @@ def _create_embedder(model_name: str):
     - "openai": uses OpenAI API (requires OPENAI_API_KEY)
     - default: uses SentenceTransformer (HuggingFace models)
 
-    No Float32SafeEmbedder needed for Ollama/OpenAI — they return numpy arrays
-    directly, and upstream calls .tolist() which works on numpy natively.
+    All providers are wrapped in Float32SafeEmbedder for JSON safety (#13) —
+    upstream serializes embeddings to JSON, and numpy float32 is not JSON-serializable.
     """
     provider = os.environ.get("RLM_EMBEDDING_PROVIDER", "").lower()
 
     if provider == "ollama":
         base_url = os.environ.get("OLLAMA_BASE_URL", "http://localhost:11434")
-        embedder = OllamaEmbedder(model_name, base_url)
-        dim = embedder.get_sentence_embedding_dimension()
+        raw_embedder = OllamaEmbedder(model_name, base_url)
+        dim = raw_embedder.get_sentence_embedding_dimension()
+        # Wrap for JSON safety (#13) — Ollama returns numpy float32
+        embedder = Float32SafeEmbedder(raw_embedder)
         print(f"  Embedding: {model_name} via Ollama at {base_url} (dim={dim})")
         return embedder, dim
 
@@ -189,8 +191,10 @@ def _create_embedder(model_name: str):
         if not api_key and not base_url:
             raise ValueError("RLM_EMBEDDING_PROVIDER=openai but OPENAI_API_KEY not set")
         effective_model = model_name or "text-embedding-3-small"
-        embedder = OpenAIEmbedder(effective_model, api_key, base_url)
-        dim = embedder.get_sentence_embedding_dimension()
+        raw_embedder = OpenAIEmbedder(effective_model, api_key, base_url)
+        dim = raw_embedder.get_sentence_embedding_dimension()
+        # Wrap for JSON safety (#13) — OpenAI returns numpy float32
+        embedder = Float32SafeEmbedder(raw_embedder)
         target = base_url or "OpenAI API"
         print(f"  Embedding: {effective_model} via {target} (dim={dim})")
         return embedder, dim
@@ -231,6 +235,49 @@ def _patch_embedding(server):
         if router and hasattr(router, "embedding_service"):
             router.embedding_service._model = embedder
             router.embedding_service._model_name = model_name
+
+        # Lower similarity threshold for non-MiniLM models (different similarity scales)
+        # MiniLM: cosine similarity ~0.5-0.9 for related texts
+        # qwen3/Ollama: cosine similarity ~0.2-0.6 for related texts
+        provider = os.environ.get("RLM_EMBEDDING_PROVIDER", "").lower()
+        if provider in ("ollama", "openai"):
+            from rlm_toolkit.memory_bridge.v2.router import SemanticRouter
+
+            # Patch existing and future instances: lower threshold for non-MiniLM models
+            _original_init = SemanticRouter.__init__
+
+            def _patched_init(self, *args, **kwargs):
+                _original_init(self, *args, **kwargs)
+                self.similarity_threshold = 0.15
+
+            SemanticRouter.__init__ = _patched_init
+
+            # Also find and patch existing router instance via gc
+            import gc
+            for obj in gc.get_objects():
+                if isinstance(obj, SemanticRouter):
+                    obj.similarity_threshold = 0.15
+                    print(f"  Router instance patched: threshold → 0.15")
+            print("  Router class patched: threshold → 0.15 (external embedding model)")
+
+        # Class-level patch: override EmbeddingService.model property to always use our embedder.
+        # This catches ALL EmbeddingService instances (router creates its own during tool registration).
+        from rlm_toolkit.memory_bridge.v2.embeddings import EmbeddingService
+
+        EmbeddingService._patched_model = embedder
+        EmbeddingService._patched_model_name = model_name
+
+        _original_model_getter = EmbeddingService.model.fget
+
+        @property
+        def _patched_model_prop(self):
+            if hasattr(EmbeddingService, "_patched_model") and EmbeddingService._patched_model is not None:
+                self._model = EmbeddingService._patched_model
+                self._model_name = EmbeddingService._patched_model_name
+                return self._model
+            return _original_model_getter(self)
+
+        EmbeddingService.model = _patched_model_prop
 
     except Exception as e:
         import sys

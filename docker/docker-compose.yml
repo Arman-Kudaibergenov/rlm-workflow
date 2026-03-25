@@ -18,7 +18,7 @@ services:
       # - RLM_PROJECT_ROOT=/workspace
       - RLM_HOST=0.0.0.0
       - RLM_PORT=8200
-      - RLM_TRANSPORT=${RLM_TRANSPORT:-sse}
+      - RLM_TRANSPORT=${RLM_TRANSPORT:-streamable-http}
       # Embedding: default = paraphrase-multilingual-MiniLM-L12-v2 (multilingual, CPU)
       # For Ollama GPU: RLM_EMBEDDING_PROVIDER=ollama, OLLAMA_BASE_URL, RLM_EMBEDDING_MODEL
       # For OpenAI/LM Studio: RLM_EMBEDDING_PROVIDER=openai, OPENAI_API_KEY or OPENAI_API_BASE
