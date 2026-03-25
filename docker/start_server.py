@@ -346,18 +346,29 @@ def _filter_tools(server):
     if tools_env:
         allowed = {t.strip() for t in tools_env.split(",") if t.strip()}
 
-    # MCP server stores tool handlers internally
+    # MCP SDK v1: _tool_handlers dict; v2+: _tool_manager with remove_tool()
     handlers = getattr(server.mcp, "_tool_handlers", None)
-    if handlers is None:
-        print("  WARNING: Cannot filter tools — _tool_handlers not found on this MCP version")
+    if handlers is not None:
+        before = len(handlers)
+        to_remove = [name for name in handlers if name not in allowed]
+        for name in to_remove:
+            del handlers[name]
+        print(f"  Tools: {before} → {len(handlers)} (default set)")
         return
 
-    before = len(handlers)
-    to_remove = [name for name in handlers if name not in allowed]
-    for name in to_remove:
-        del handlers[name]
+    # v2+: use list_tools/remove_tool API
+    tool_manager = getattr(server.mcp, "_tool_manager", None)
+    if tool_manager is not None:
+        all_tools = server.mcp.list_tools()
+        before = len(all_tools)
+        for tool in all_tools:
+            if tool.name not in allowed:
+                server.mcp.remove_tool(tool.name)
+        after = len(server.mcp.list_tools())
+        print(f"  Tools: {before} → {after} (default set)")
+        return
 
-    print(f"  Tools: {before} → {len(handlers)} (default set)")
+    print("  WARNING: Cannot filter tools — no known tool storage found")
 
 
 def main():
