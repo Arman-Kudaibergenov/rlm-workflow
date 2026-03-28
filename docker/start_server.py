@@ -622,25 +622,27 @@ def _patch_prevent_default_embedding():
 
     provider = os.environ.get("RLM_EMBEDDING_PROVIDER", "").lower()
 
-    # Change DEFAULT_MODEL in ALL upstream modules that hardcode it
-    patched = []
-    for mod_path in [
-        "rlm_toolkit.retrieval.embeddings",
-        "rlm_toolkit.memory_bridge.v2.embeddings",
-    ]:
-        try:
-            import importlib
-            mod = importlib.import_module(mod_path)
-            for cls_name in dir(mod):
-                cls = getattr(mod, cls_name)
-                if isinstance(cls, type) and hasattr(cls, 'DEFAULT_MODEL'):
-                    old = cls.DEFAULT_MODEL
-                    cls.DEFAULT_MODEL = model_name
-                    patched.append(f"{cls_name}")
-        except ImportError:
-            pass
-    if patched:
-        print(f"  [#24] DEFAULT_MODEL → '{model_name}' in: {', '.join(patched)}")
+    # For local SentenceTransformer: change DEFAULT_MODEL so upstream loads the right model.
+    # For ollama/openai: DON'T change DEFAULT_MODEL (model name format incompatible with ST).
+    if provider not in ("ollama", "openai"):
+        patched = []
+        for mod_path in [
+            "rlm_toolkit.retrieval.embeddings",
+            "rlm_toolkit.memory_bridge.v2.embeddings",
+        ]:
+            try:
+                import importlib
+                mod = importlib.import_module(mod_path)
+                for cls_name in dir(mod):
+                    cls = getattr(mod, cls_name)
+                    if isinstance(cls, type) and hasattr(cls, 'DEFAULT_MODEL'):
+                        old = cls.DEFAULT_MODEL
+                        cls.DEFAULT_MODEL = model_name
+                        patched.append(f"{cls_name}")
+            except ImportError:
+                pass
+        if patched:
+            print(f"  [#24] DEFAULT_MODEL → '{model_name}' in: {', '.join(patched)}")
 
     # server.py:140 hardcodes SentenceTransformer("all-MiniLM-L6-v2") as a string literal.
     # DEFAULT_MODEL patching doesn't help there. We intercept SentenceTransformer to either:
