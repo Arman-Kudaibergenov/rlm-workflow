@@ -6,6 +6,11 @@ Applies monkey-patches for:
 - #8/#7/#18: Session restore — "default" session only, no fallback to latest
 - #16: Single embedder instance reused across store and router
 - #17: Suppress misleading FileWatcher log from upstream
+- #19: search_facts — ensure session before hybrid_search
+- #20: discover_project — normalize Windows paths to container paths
+- #22: enterprise_context — log causal failures at WARNING, not DEBUG
+- #23: project overview — suppress noisy fingerprint, improve Unknown project
+- #24: double embedding load — prevent upstream default model init
 """
 
 import argparse
@@ -45,10 +50,11 @@ class Float32SafeEmbedder:
 def _patch_session_restore():
     """Patch MemoryBridgeManager.start_session to restore "default" session when session_id=None.
 
-    Fixes GitHub issues #8, #7, #18: without this patch, restore=True with session_id=None
+    Fixes GitHub issues #8, #7, #18, #21: without this patch, restore=True with session_id=None
     either generates a random UUID (empty session) or falls back to latest session (isolation risk).
 
     Now: only restores named "default" session. If absent, creates new session via upstream.
+    #21 fix: don't bump version on restore — only bump on sync.
     """
     from datetime import datetime
 
@@ -61,7 +67,7 @@ def _patch_session_restore():
             # Only restore named "default" session — no fallback to latest (isolation, #18)
             state = self.storage.load_state("default")
             if state:
-                state.version += 1
+                # #21: don't bump version on restore — version only bumps on sync
                 state.timestamp = datetime.now()
                 self._current_state = state
                 print(f"  Session restored: 'default' (v{state.version})")
@@ -370,6 +376,328 @@ def _filter_tools(server):
     print("  WARNING: Cannot filter tools — no known tool storage found")
 
 
+def _patch_search_facts():
+    """Redirect search_facts to use v2 HierarchicalMemoryStore instead of v1 manager.
+
+    Fixes GitHub issue #19: search_facts returns empty because v1 manager.hybrid_search()
+    looks at v1 _current_state.facts, but rlm_add_hierarchical_fact stores facts in v2 store.
+    This patch makes hybrid_search query the v2 store directly.
+    """
+    import math
+    from datetime import datetime
+
+    from rlm_toolkit.memory_bridge.manager import MemoryBridgeManager
+
+    def _v2_hybrid_search(self, query, top_k=10, semantic_weight=0.5,
+                          keyword_weight=0.3, recency_weight=0.2):
+        """Hybrid search across v2 hierarchical facts."""
+        # Get v2 store from server components (set by _patch_embedding or create_server)
+        store = getattr(self, '_v2_store', None)
+        if not store:
+            # Fallback: try to find v2 store via gc
+            import gc
+            from rlm_toolkit.memory_bridge.v2.hierarchical import HierarchicalMemoryStore
+            for obj in gc.get_objects():
+                if isinstance(obj, HierarchicalMemoryStore):
+                    store = obj
+                    self._v2_store = store
+                    break
+
+        if not store:
+            print("  [#19] No v2 store found — falling back to v1")
+            # Original v1 behavior
+            if not self._current_state:
+                return []
+            query_tokens = set(query.lower().split())
+            now = datetime.now()
+            scored = []
+            for fact in self._current_state.facts:
+                if not fact.is_current():
+                    continue
+                fact_tokens = set(fact.content.lower().split())
+                union_size = len(query_tokens | fact_tokens)
+                keyword = len(query_tokens & fact_tokens) / max(union_size, 1)
+                age_hours = (now - fact.created_at).total_seconds() / 3600
+                recency = math.exp(-age_hours / 168)
+                score = keyword_weight * keyword + recency_weight * recency
+                scored.append((fact, score))
+            return sorted(scored, key=lambda x: -x[1])[:top_k]
+
+        # v2 search: get all facts with embeddings, compute hybrid scores
+        facts_with_emb = store.get_facts_with_embeddings()
+        all_facts = store.get_all_facts() if not facts_with_emb else []
+
+        # Get query embedding
+        embedder = getattr(store, '_embedder', None)
+        query_embedding = None
+        if embedder:
+            try:
+                import numpy as np
+                raw = embedder.encode(query)
+                query_embedding = raw.tolist() if hasattr(raw, 'tolist') else list(raw)
+            except Exception:
+                pass
+
+        query_tokens = set(query.lower().split())
+        now = datetime.now()
+        scored = []
+
+        def _cosine(a, b):
+            import numpy as np
+            a, b = np.array(a), np.array(b)
+            dot = np.dot(a, b)
+            na, nb = np.linalg.norm(a), np.linalg.norm(b)
+            return float(dot / (na * nb)) if na > 0 and nb > 0 else 0.0
+
+        # Score facts with embeddings
+        for fact, emb in facts_with_emb:
+            semantic = _cosine(query_embedding, emb) if query_embedding and emb else 0.0
+            fact_tokens = set(fact.content.lower().split())
+            union_size = len(query_tokens | fact_tokens)
+            keyword = len(query_tokens & fact_tokens) / max(union_size, 1)
+            age_hours = (now - fact.created_at).total_seconds() / 3600
+            recency = math.exp(-age_hours / 168)
+            score = semantic_weight * semantic + keyword_weight * keyword + recency_weight * recency
+            scored.append((fact, score))
+
+        # Also score facts without embeddings (keyword + recency only)
+        emb_ids = {f.id for f, _ in facts_with_emb}
+        for fact in all_facts:
+            if fact.id in emb_ids:
+                continue
+            fact_tokens = set(fact.content.lower().split())
+            union_size = len(query_tokens | fact_tokens)
+            keyword = len(query_tokens & fact_tokens) / max(union_size, 1)
+            age_hours = (now - fact.created_at).total_seconds() / 3600
+            recency = math.exp(-age_hours / 168)
+            score = keyword_weight * keyword + recency_weight * recency
+            scored.append((fact, score))
+
+        # Wrap v2 facts with v1-compatible attributes for serialization
+        result = sorted(scored, key=lambda x: -x[1])[:top_k]
+        for fact, _ in result:
+            if not hasattr(fact, 'entity_type'):
+                # Add v1-compatible shim: entity_type with .value
+                class _EntityShim:
+                    def __init__(self, val):
+                        self.value = val
+                fact.entity_type = _EntityShim(fact.domain or "fact")
+        return result
+
+    MemoryBridgeManager.hybrid_search = _v2_hybrid_search
+
+
+def _patch_discover_project():
+    """Normalize Windows paths for discover_project running inside Linux container.
+
+    Fixes GitHub issue #20: Windows clients send paths like 'd:\\Repos\\BIT'
+    which don't exist inside the container. Map to container's /data path.
+    """
+    try:
+        from rlm_toolkit.memory_bridge.v2.coldstart import ColdStartOptimizer
+    except ImportError:
+        print("  [#20] Cannot patch discover_project — ColdStartOptimizer import failed")
+        return
+
+    _original_discover = ColdStartOptimizer.discover_project
+
+    def _patched_discover(self, root=None, task_hint=None, **kwargs):
+        import re
+        from pathlib import Path
+
+        if root and isinstance(root, (str, Path)):
+            path_str = str(root)
+            # Detect Windows path (drive letter or backslashes)
+            if re.match(r'^[A-Za-z]:[/\\]', path_str) or '\\' in path_str:
+                container_root = os.environ.get("RLM_PROJECT_ROOT", "/data")
+                print(f"  [#20] Windows path '{path_str}' → container path '{container_root}'")
+                root = Path(container_root)
+
+        return _original_discover(self, root=root, task_hint=task_hint, **kwargs)
+
+    ColdStartOptimizer.discover_project = _patched_discover
+
+
+def _patch_causal_context():
+    """Log causal context failures at WARNING level instead of DEBUG.
+
+    Fixes GitHub issue #22: enterprise_context with include_causal=true silently
+    returns causal_included=false because exceptions are caught at DEBUG level.
+    """
+    try:
+        from rlm_toolkit.memory_bridge.v2.automode import EnterpriseContextBuilder
+    except ImportError:
+        print("  [#22] Cannot patch causal context — import failed")
+        return
+
+    if not hasattr(EnterpriseContextBuilder, '_get_causal_summary'):
+        print("  [#22] _get_causal_summary not found — skipping")
+        return
+
+    _original_causal = EnterpriseContextBuilder._get_causal_summary
+
+    def _patched_causal(self, query):
+        try:
+            result = _original_causal(self, query)
+            if not result:
+                logger = logging.getLogger("rlm_workflow")
+                # Check if causal_tracker is initialized
+                tracker = getattr(self, 'causal_tracker', None)
+                if tracker is None:
+                    logger.warning("[#22] causal_tracker is None — causal context unavailable")
+                else:
+                    logger.warning(f"[#22] causal query returned empty for: {query[:80]}")
+            return result
+        except Exception as e:
+            logger = logging.getLogger("rlm_workflow")
+            logger.warning(f"[#22] Causal context failed: {type(e).__name__}: {e}")
+            return ""
+
+    EnterpriseContextBuilder._get_causal_summary = _patched_causal
+
+
+def _patch_project_overview():
+    """Suppress noisy fingerprint in project overview and improve Unknown project display.
+
+    Fixes GitHub issue #23: route_context and enterprise_context show
+    'data is a Unknown project' with noisy __FINGERPRINT__ content.
+    """
+    try:
+        from rlm_toolkit.memory_bridge.v2.automode import EnterpriseContextBuilder
+    except ImportError:
+        print("  [#23] Cannot patch project overview — import failed")
+        return
+
+    if not hasattr(EnterpriseContextBuilder, '_get_project_overview'):
+        print("  [#23] _get_project_overview not found — skipping")
+        return
+
+    _original_overview = EnterpriseContextBuilder._get_project_overview
+
+    def _patched_overview(self):
+        result = _original_overview(self)
+        if not result:
+            return result
+        lines = result.split('\n')
+        cleaned = [
+            line for line in lines
+            if '__FINGERPRINT__' not in line
+            and 'Unknown project' not in line
+        ]
+        return '\n'.join(cleaned).strip()
+
+    EnterpriseContextBuilder._get_project_overview = _patched_overview
+
+    # Also patch to_injection_string to filter fingerprint/Unknown from L0 facts
+    from rlm_toolkit.memory_bridge.v2.automode import EnterpriseContext
+
+    _original_inject = EnterpriseContext.to_injection_string
+
+    def _patched_inject(self):
+        result = _original_inject(self)
+        lines = result.split('\n')
+        cleaned = [
+            line for line in lines
+            if '__FINGERPRINT__' not in line
+            and 'is a Unknown project' not in line
+        ]
+        return '\n'.join(cleaned)
+
+    EnterpriseContext.to_injection_string = _patched_inject
+
+
+def _patch_prevent_default_embedding():
+    """Set the correct default model BEFORE upstream loads it.
+
+    Fixes GitHub issue #24: upstream hardcodes DEFAULT_MODEL = "all-MiniLM-L6-v2".
+    Instead of intercepting SentenceTransformer constructor, we simply change the
+    DEFAULT_MODEL constant so upstream loads the right model on first try.
+
+    For ollama/openai providers: stub SentenceTransformer entirely since embedding
+    happens via HTTP API, not local model.
+    """
+    model_name = os.environ.get("RLM_EMBEDDING_MODEL", "")
+    if not model_name:
+        return
+
+    provider = os.environ.get("RLM_EMBEDDING_PROVIDER", "").lower()
+
+    # Change DEFAULT_MODEL in ALL upstream modules that hardcode it
+    patched = []
+    for mod_path in [
+        "rlm_toolkit.retrieval.embeddings",
+        "rlm_toolkit.memory_bridge.v2.embeddings",
+    ]:
+        try:
+            import importlib
+            mod = importlib.import_module(mod_path)
+            for cls_name in dir(mod):
+                cls = getattr(mod, cls_name)
+                if isinstance(cls, type) and hasattr(cls, 'DEFAULT_MODEL'):
+                    old = cls.DEFAULT_MODEL
+                    cls.DEFAULT_MODEL = model_name
+                    patched.append(f"{cls_name}")
+        except ImportError:
+            pass
+    if patched:
+        print(f"  [#24] DEFAULT_MODEL → '{model_name}' in: {', '.join(patched)}")
+
+    # server.py:140 hardcodes SentenceTransformer("all-MiniLM-L6-v2") as a string literal.
+    # DEFAULT_MODEL patching doesn't help there. We intercept SentenceTransformer to either:
+    # - ollama/openai: stub it (embedding via HTTP API, not local model)
+    # - local ST: replace the model name on first call
+    import sentence_transformers as st_module
+    _original_st_class = st_module.SentenceTransformer
+
+    if provider in ("ollama", "openai"):
+        class _StubEmbedder:
+            """Lightweight stub — real embedding happens via HTTP API."""
+            def __init__(self, model_name_or_path=None, **kwargs):
+                self._dim = 384
+
+            def encode(self, sentences, **kwargs):
+                import numpy as np
+                if isinstance(sentences, str):
+                    return np.zeros(self._dim, dtype=np.float64)
+                return np.zeros((len(sentences), self._dim), dtype=np.float64)
+
+            def get_sentence_embedding_dimension(self):
+                return self._dim
+
+        class _InterceptedST:
+            """Intercept all SentenceTransformer calls — stub for server.py hardcoded load."""
+            def __new__(cls, model_name_or_path=None, **kwargs):
+                if model_name_or_path == model_name:
+                    # This is our own _patch_embedding call — let it through
+                    return _original_st_class(model_name_or_path, **kwargs)
+                print(f"  [#24] Stubbing '{model_name_or_path}' (will use {provider}:{model_name})")
+                return _StubEmbedder(model_name_or_path, **kwargs)
+    else:
+        class _InterceptedST:
+            """Redirect any hardcoded model name to the configured one."""
+            def __new__(cls, model_name_or_path=None, **kwargs):
+                actual = model_name if model_name_or_path != model_name else model_name_or_path
+                if actual != model_name_or_path:
+                    print(f"  [#24] '{model_name_or_path}' → '{actual}'")
+                return _original_st_class(actual, **kwargs)
+
+    # Patch everywhere: main module + all modules that did `from ... import SentenceTransformer`
+    st_module.SentenceTransformer = _InterceptedST
+    for mod_path in [
+        "rlm_toolkit.retrieval.embeddings",
+        "rlm_toolkit.memory_bridge.v2.embeddings",
+        "rlm_toolkit.mcp.server",
+    ]:
+        try:
+            import importlib
+            mod = importlib.import_module(mod_path)
+            if hasattr(mod, 'SentenceTransformer'):
+                mod.SentenceTransformer = _InterceptedST
+        except ImportError:
+            pass
+    print(f"  [#24] SentenceTransformer intercepted — all loads use '{model_name}'")
+
+
 def main():
     parser = argparse.ArgumentParser(description="RLM-Toolkit MCP server launcher")
     parser.add_argument("--host", default="0.0.0.0")
@@ -383,8 +711,13 @@ def main():
     # Suppress misleading upstream logs (#17) — before server creation
     _suppress_misleading_logs()
 
-    # Apply session restore patch BEFORE creating server (class-level patch)
-    _patch_session_restore()
+    # Apply class-level patches BEFORE creating server
+    _patch_session_restore()          # #8/#7/#18/#21
+    _patch_search_facts()             # #19
+    _patch_discover_project()         # #20
+    _patch_causal_context()           # #22
+    _patch_project_overview()         # #23
+    _patch_prevent_default_embedding()  # #24 — must be before create_server()
 
     from rlm_toolkit.mcp.server import create_server
 
