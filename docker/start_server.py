@@ -48,13 +48,13 @@ class Float32SafeEmbedder:
 
 
 def _patch_session_restore():
-    """Patch MemoryBridgeManager.start_session to restore "default" session when session_id=None.
+    """Patch MemoryBridgeManager.start_session to use "default" as canonical session name.
 
     Fixes GitHub issues #8, #7, #18, #21: without this patch, restore=True with session_id=None
     either generates a random UUID (empty session) or falls back to latest session (isolation risk).
 
-    Now: only restores named "default" session. If absent, creates new session via upstream.
-    #21 fix: don't bump version on restore — only bump on sync.
+    Key insight (#21 fix): when session_id=None, we pass "default" to upstream so that
+    sync_state saves under "default" — making future restore=True find the session.
     """
     from datetime import datetime
 
@@ -63,17 +63,31 @@ def _patch_session_restore():
     _original = MemoryBridgeManager.start_session
 
     def _patched(self, session_id=None, restore=True):
+        # When no explicit session_id, use "default" as canonical name.
+        # This ensures sync_state saves under "default" and restore finds it.
+        effective_id = session_id if session_id is not None else "default"
+
         if restore and session_id is None:
             # Only restore named "default" session — no fallback to latest (isolation, #18)
             state = self.storage.load_state("default")
             if state:
-                # #21: don't bump version on restore — version only bumps on sync
+                # Bump version on restore — MCP tool checks version > 1 for restored flag
+                state.version += 1
                 state.timestamp = datetime.now()
                 self._current_state = state
                 print(f"  Session restored: 'default' (v{state.version})")
                 return state
             print("  No 'default' session found — creating new session")
-        return _original(self, session_id=session_id, restore=restore)
+
+        # Create new session, but continue version sequence to avoid UNIQUE constraint
+        # (session "default" may already have versions in DB)
+        result = _original(self, session_id=effective_id, restore=False)
+        if effective_id == "default" and result.version == 1:
+            existing = self.storage.load_state("default")
+            if existing and existing.version >= result.version:
+                result.version = existing.version + 1
+                self._current_state = result
+        return result
 
     MemoryBridgeManager.start_session = _patched
 
@@ -519,10 +533,14 @@ def _patch_discover_project():
 
 
 def _patch_causal_context():
-    """Log causal context failures at WARNING level instead of DEBUG.
+    """Fix causal context retrieval — fallback to recent decisions when LIKE search fails.
 
-    Fixes GitHub issue #22: enterprise_context with include_causal=true silently
-    returns causal_included=false because exceptions are caught at DEBUG level.
+    Fixes GitHub issue #22: enterprise_context with include_causal=true returns
+    causal_included=false because upstream query_chain uses LIKE substring matching
+    which rarely matches natural language queries.
+
+    This patch adds a fallback: if upstream query_chain returns nothing, directly query
+    the causal DB for recent decisions and format them as a summary.
     """
     try:
         from rlm_toolkit.memory_bridge.v2.automode import EnterpriseContextBuilder
@@ -537,20 +555,76 @@ def _patch_causal_context():
     _original_causal = EnterpriseContextBuilder._get_causal_summary
 
     def _patched_causal(self, query):
+        # Try upstream first (LIKE matching)
         try:
             result = _original_causal(self, query)
-            if not result:
-                logger = logging.getLogger("rlm_workflow")
-                # Check if causal_tracker is initialized
-                tracker = getattr(self, 'causal_tracker', None)
-                if tracker is None:
-                    logger.warning("[#22] causal_tracker is None — causal context unavailable")
-                else:
-                    logger.warning(f"[#22] causal query returned empty for: {query[:80]}")
-            return result
+            if result:
+                return result
         except Exception as e:
             logger = logging.getLogger("rlm_workflow")
-            logger.warning(f"[#22] Causal context failed: {type(e).__name__}: {e}")
+            logger.warning(f"[#22] Upstream causal query failed: {type(e).__name__}: {e}")
+
+        # Fallback: query recent decisions directly from causal DB
+        tracker = getattr(self, 'causal_tracker', None)
+        if tracker is None:
+            return ""
+
+        try:
+            import sqlite3
+            db_path = getattr(tracker, 'db_path', None)
+            if not db_path or not db_path.exists():
+                return ""
+
+            with sqlite3.connect(db_path) as conn:
+                conn.row_factory = sqlite3.Row
+                # Get recent decisions (last 10), keyword-match by splitting query words
+                words = [w.lower() for w in query.split() if len(w) > 2]
+                if words:
+                    # Build OR conditions for keyword matching
+                    conditions = " OR ".join(["LOWER(content) LIKE ?" for _ in words])
+                    params = [f"%{w}%" for w in words]
+                    sql = f"""
+                        SELECT content, created_at FROM causal_nodes
+                        WHERE node_type = 'decision' AND ({conditions})
+                        ORDER BY created_at DESC LIMIT 5
+                    """
+                    rows = conn.execute(sql, params).fetchall()
+                else:
+                    # No useful keywords — just get most recent decisions
+                    rows = conn.execute("""
+                        SELECT content, created_at FROM causal_nodes
+                        WHERE node_type = 'decision'
+                        ORDER BY created_at DESC LIMIT 5
+                    """).fetchall()
+
+                if not rows:
+                    return ""
+
+                # Format as summary
+                parts = ["## Recent Decisions"]
+                for row in rows:
+                    parts.append(f"- [{row['created_at'][:16]}] {row['content']}")
+
+                # Also get reasons linked to these decisions
+                for row in rows:
+                    reason_rows = conn.execute("""
+                        SELECT cn.content FROM causal_nodes cn
+                        JOIN causal_edges ce ON ce.to_id = cn.id
+                        WHERE ce.from_id IN (
+                            SELECT id FROM causal_nodes
+                            WHERE content = ? AND node_type = 'decision'
+                        )
+                        AND cn.node_type = 'reason'
+                        LIMIT 3
+                    """, [row['content']]).fetchall()
+                    if reason_rows:
+                        parts.append(f"  Reasons: {', '.join(r['content'] for r in reason_rows)}")
+
+                return "\n".join(parts)
+
+        except Exception as e:
+            logger = logging.getLogger("rlm_workflow")
+            logger.warning(f"[#22] Causal fallback query failed: {type(e).__name__}: {e}")
             return ""
 
     EnterpriseContextBuilder._get_causal_summary = _patched_causal
