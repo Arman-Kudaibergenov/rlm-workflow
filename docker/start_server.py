@@ -63,11 +63,13 @@ def _patch_session_restore():
     _original = MemoryBridgeManager.start_session
 
     def _patched(self, session_id=None, restore=True):
-        # When no explicit session_id, use "default" as canonical name.
-        # This ensures sync_state saves under "default" and restore finds it.
-        effective_id = session_id if session_id is not None else "default"
+        # When explicit session_id is provided, delegate to upstream unchanged (BLOCKER fix)
+        if session_id is not None:
+            return _original(self, session_id=session_id, restore=restore)
 
-        if restore and session_id is None:
+        # When no session_id, use "default" as canonical name.
+        # This ensures sync_state saves under "default" and restore finds it.
+        if restore:
             # Only restore named "default" session — no fallback to latest (isolation, #18)
             state = self.storage.load_state("default")
             if state:
@@ -79,10 +81,9 @@ def _patch_session_restore():
                 return state
             print("  No 'default' session found — creating new session")
 
-        # Create new session, but continue version sequence to avoid UNIQUE constraint
-        # (session "default" may already have versions in DB)
-        result = _original(self, session_id=effective_id, restore=False)
-        if effective_id == "default" and result.version == 1:
+        # Create new session under "default", continue version sequence to avoid UNIQUE constraint
+        result = _original(self, session_id="default", restore=False)
+        if result.version == 1:
             existing = self.storage.load_state("default")
             if existing and existing.version >= result.version:
                 result.version = existing.version + 1
@@ -577,22 +578,20 @@ def _patch_causal_context():
 
             with sqlite3.connect(db_path) as conn:
                 conn.row_factory = sqlite3.Row
-                # Get recent decisions (last 10), keyword-match by splitting query words
+                # Get recent decisions, keyword-match by splitting query words
                 words = [w.lower() for w in query.split() if len(w) > 2]
                 if words:
-                    # Build OR conditions for keyword matching
                     conditions = " OR ".join(["LOWER(content) LIKE ?" for _ in words])
                     params = [f"%{w}%" for w in words]
                     sql = f"""
-                        SELECT content, created_at FROM causal_nodes
+                        SELECT id, content, created_at FROM causal_nodes
                         WHERE node_type = 'decision' AND ({conditions})
                         ORDER BY created_at DESC LIMIT 5
                     """
                     rows = conn.execute(sql, params).fetchall()
                 else:
-                    # No useful keywords — just get most recent decisions
                     rows = conn.execute("""
-                        SELECT content, created_at FROM causal_nodes
+                        SELECT id, content, created_at FROM causal_nodes
                         WHERE node_type = 'decision'
                         ORDER BY created_at DESC LIMIT 5
                     """).fetchall()
@@ -600,23 +599,19 @@ def _patch_causal_context():
                 if not rows:
                     return ""
 
-                # Format as summary
                 parts = ["## Recent Decisions"]
                 for row in rows:
                     parts.append(f"- [{row['created_at'][:16]}] {row['content']}")
 
-                # Also get reasons linked to these decisions
-                for row in rows:
+                    # Get reasons linked to THIS specific decision by ID (not content)
+                    # Edge direction: reason --justifies--> decision (from_id=reason, to_id=decision)
                     reason_rows = conn.execute("""
                         SELECT cn.content FROM causal_nodes cn
-                        JOIN causal_edges ce ON ce.to_id = cn.id
-                        WHERE ce.from_id IN (
-                            SELECT id FROM causal_nodes
-                            WHERE content = ? AND node_type = 'decision'
-                        )
+                        JOIN causal_edges ce ON ce.from_id = cn.id
+                        WHERE ce.to_id = ?
                         AND cn.node_type = 'reason'
                         LIMIT 3
-                    """, [row['content']]).fetchall()
+                    """, [row['id']]).fetchall()
                     if reason_rows:
                         parts.append(f"  Reasons: {', '.join(r['content'] for r in reason_rows)}")
 
