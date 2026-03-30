@@ -720,6 +720,9 @@ def _patch_prevent_default_embedding():
     import sentence_transformers as st_module
     _original_st_class = st_module.SentenceTransformer
 
+    # Singleton cache — one instance reused for all SentenceTransformer calls (#28)
+    _singleton_cache = {}
+
     if provider in ("ollama", "openai"):
         class _StubEmbedder:
             """Lightweight stub — real embedding happens via HTTP API."""
@@ -736,21 +739,29 @@ def _patch_prevent_default_embedding():
                 return self._dim
 
         class _InterceptedST:
-            """Intercept all SentenceTransformer calls — stub for server.py hardcoded load."""
+            """Intercept all SentenceTransformer calls — return singleton stub (#28)."""
             def __new__(cls, model_name_or_path=None, **kwargs):
                 if model_name_or_path == model_name:
                     # This is our own _patch_embedding call — let it through
                     return _original_st_class(model_name_or_path, **kwargs)
-                print(f"  [#24] Stubbing '{model_name_or_path}' (will use {provider}:{model_name})")
-                return _StubEmbedder(model_name_or_path, **kwargs)
+                # Return cached stub — one instance for all callers (#28)
+                if "stub" not in _singleton_cache:
+                    _singleton_cache["stub"] = _StubEmbedder(model_name_or_path, **kwargs)
+                    print(f"  [#24] Stubbing '{model_name_or_path}' (will use {provider}:{model_name})")
+                return _singleton_cache["stub"]
     else:
         class _InterceptedST:
-            """Redirect any hardcoded model name to the configured one."""
+            """Redirect any hardcoded model name to the configured one — singleton (#28)."""
             def __new__(cls, model_name_or_path=None, **kwargs):
                 actual = model_name if model_name_or_path != model_name else model_name_or_path
+                # Return cached model — one load, all callers share (#28)
+                if actual in _singleton_cache:
+                    return _singleton_cache[actual]
                 if actual != model_name_or_path:
                     print(f"  [#24] '{model_name_or_path}' → '{actual}'")
-                return _original_st_class(actual, **kwargs)
+                instance = _original_st_class(actual, **kwargs)
+                _singleton_cache[actual] = instance
+                return instance
 
     # Patch everywhere: main module + all modules that did `from ... import SentenceTransformer`
     st_module.SentenceTransformer = _InterceptedST
