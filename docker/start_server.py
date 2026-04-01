@@ -1,7 +1,7 @@
 """Thin wrapper to launch rlm-toolkit MCP server with configurable transport and bind address.
 
 Applies monkey-patches for:
-- #13: Float32SafeEmbedder wrapper for numpy→Python float conversion
+- #13: Float32SafeEmbedder wrapper for numpy->Python float conversion
 - #5/#4: Embedding model override from RLM_EMBEDDING_MODEL env var
 - #8/#7/#18: Session restore — "default" session only, no fallback to latest
 - #16: Single embedder instance reused across store and router
@@ -11,6 +11,10 @@ Applies monkey-patches for:
 - #22: enterprise_context — log causal failures at WARNING, not DEBUG
 - #23: project overview — suppress noisy fingerprint, improve Unknown project
 - #24: double embedding load — prevent upstream default model init
+- #29: add rlm_get_facts_by_domain to default tool set
+- #31: ttl_days=0 falsy check — patch tool closure after create_server()
+- #33: route_context noise — filter __FINGERPRINT__ and Unknown project from format output
+- #34: search_facts min_score threshold — filter garbage results below 0.45
 """
 
 import argparse
@@ -19,7 +23,7 @@ import os
 
 
 class Float32SafeEmbedder:
-    """Wraps embedders to convert numpy float32 → float64 for JSON safety.
+    """Wraps embedders to convert numpy float32 -> float64 for JSON safety.
 
     Fixes GitHub issue #13: rlm-toolkit serializes embeddings to JSON, but numpy.float32
     is not JSON-serializable. This wrapper intercepts encode() output and converts to float64
@@ -225,7 +229,7 @@ def _create_embedder(model_name: str):
 
     raw_embedder = SentenceTransformer(model_name)
     dim = raw_embedder.get_sentence_embedding_dimension()
-    # Wrap for JSON safety (#13) — convert numpy float32 → Python float
+    # Wrap for JSON safety (#13) — convert numpy float32 -> Python float
     embedder = Float32SafeEmbedder(raw_embedder)
     print(f"  Embedding: {model_name} (dim={dim}, from RLM_EMBEDDING_MODEL)")
     return embedder, dim
@@ -278,8 +282,8 @@ def _patch_embedding(server):
             for obj in gc.get_objects():
                 if isinstance(obj, SemanticRouter):
                     obj.similarity_threshold = 0.15
-                    print(f"  Router instance patched: threshold → 0.15")
-            print("  Router class patched: threshold → 0.15 (external embedding model)")
+                    print(f"  Router instance patched: threshold -> 0.15")
+            print("  Router class patched: threshold -> 0.15 (external embedding model)")
 
         # Class-level patch: override EmbeddingService.model property to always use our embedder.
         # This catches ALL EmbeddingService instances (router creates its own during tool registration).
@@ -347,6 +351,7 @@ _DEFAULT_TOOLS = {
     "rlm_sync_state",
     "rlm_discover_project",
     "rlm_enterprise_context",
+    "rlm_get_facts_by_domain",
 }
 
 
@@ -354,8 +359,8 @@ def _filter_tools(server):
     """Filter MCP tools to a curated default set.
 
     Default: 12 essential tools (memory, search, routing, governance).
-    RLM_TOOLS=all → keep all tools (no filtering).
-    RLM_TOOLS=tool1,tool2 → custom whitelist.
+    RLM_TOOLS=all -> keep all tools (no filtering).
+    RLM_TOOLS=tool1,tool2 -> custom whitelist.
     """
     tools_env = os.environ.get("RLM_TOOLS", "").strip()
 
@@ -374,7 +379,7 @@ def _filter_tools(server):
         to_remove = [name for name in handlers if name not in allowed]
         for name in to_remove:
             del handlers[name]
-        print(f"  Tools: {before} → {len(handlers)} (default set)")
+        print(f"  Tools: {before} -> {len(handlers)} (default set)")
         return
 
     # v2+: _tool_manager._tools is a dict
@@ -385,7 +390,7 @@ def _filter_tools(server):
         to_remove = [name for name in tools_dict if name not in allowed]
         for name in to_remove:
             del tools_dict[name]
-        print(f"  Tools: {before} → {len(tools_dict)} (default set)")
+        print(f"  Tools: {before} -> {len(tools_dict)} (default set)")
         return
 
     print("  WARNING: Cannot filter tools — no known tool storage found")
@@ -441,17 +446,17 @@ def _patch_search_facts():
         # v2 search: get all facts with embeddings, compute hybrid scores
         facts_with_emb = store.get_facts_with_embeddings()
         all_facts = store.get_all_facts() if not facts_with_emb else []
-
-        # Get query embedding
         embedder = getattr(store, '_embedder', None)
+
+        # Get query embedding (embedder already fetched above for debug)
         query_embedding = None
         if embedder:
             try:
                 import numpy as np
                 raw = embedder.encode(query)
                 query_embedding = raw.tolist() if hasattr(raw, 'tolist') else list(raw)
-            except Exception:
-                pass
+            except Exception as e:
+                print(f"  [#19] Embedding failed: {type(e).__name__}: {e}")
 
         query_tokens = set(query.lower().split())
         now = datetime.now()
@@ -464,8 +469,16 @@ def _patch_search_facts():
             na, nb = np.linalg.norm(a), np.linalg.norm(b)
             return float(dot / (na * nb)) if na > 0 and nb > 0 else 0.0
 
-        # Score facts with embeddings
+        # Skip noise and stale facts (#31 TTL, #33 noise alignment)
+        def _is_noise(fact):
+            c = fact.content.strip()
+            return (c.startswith("__FINGERPRINT__:") or
+                    "is a Unknown project" in c or
+                    c == "Unknown project")
+
         for fact, emb in facts_with_emb:
+            if getattr(fact, 'is_stale', False) or _is_noise(fact):
+                continue
             semantic = _cosine(query_embedding, emb) if query_embedding and emb else 0.0
             fact_tokens = set(fact.content.lower().split())
             union_size = len(query_tokens | fact_tokens)
@@ -478,6 +491,8 @@ def _patch_search_facts():
         # Also score facts without embeddings (keyword + recency only)
         emb_ids = {f.id for f, _ in facts_with_emb}
         for fact in all_facts:
+            if getattr(fact, 'is_stale', False) or _is_noise(fact):
+                continue
             if fact.id in emb_ids:
                 continue
             fact_tokens = set(fact.content.lower().split())
@@ -489,7 +504,9 @@ def _patch_search_facts():
             scored.append((fact, score))
 
         # Wrap v2 facts with v1-compatible attributes for serialization
+        min_score = float(os.environ.get("RLM_MIN_SCORE", "0.55"))
         result = sorted(scored, key=lambda x: -x[1])[:top_k]
+        result = [(fact, score) for fact, score in result if score >= min_score]
         for fact, _ in result:
             if not hasattr(fact, 'entity_type'):
                 # Add v1-compatible shim: entity_type with .value
@@ -520,15 +537,34 @@ def _patch_discover_project():
         import re
         from pathlib import Path
 
+        original_path = str(root) if root else None
+        container_root = os.environ.get("RLM_PROJECT_ROOT", "/data")
+
         if root and isinstance(root, (str, Path)):
             path_str = str(root)
             # Detect Windows path (drive letter or backslashes)
             if re.match(r'^[A-Za-z]:[/\\]', path_str) or '\\' in path_str:
-                container_root = os.environ.get("RLM_PROJECT_ROOT", "/data")
-                print(f"  [#20] Windows path '{path_str}' → container path '{container_root}'")
+                print(f"  [#20] Windows path '{path_str}' -> container path '{container_root}'")
                 root = Path(container_root)
 
-        return _original_discover(self, root=root, task_hint=task_hint, **kwargs)
+        result = _original_discover(self, root=root, task_hint=task_hint, **kwargs)
+
+        # Fix project name: if upstream returned container dir name, use Windows path basename
+        container_basename = Path(container_root).name
+        if original_path and result.project_info.name == container_basename:
+            win_name = original_path.replace('\\', '/').rstrip('/').split('/')[-1]
+            result.project_info.name = win_name
+            print(f"  [#32] project_name '{container_basename}' -> '{win_name}' (from original path)")
+
+        # Add bind-mount guidance if container path is empty
+        if result.project_info.file_count == 0 and original_path:
+            win_name = original_path.replace('\\', '/').rstrip('/').split('/')[-1]
+            guidance = (f"Project files not mounted in container. "
+                        f"Use: -v /host/path/{win_name}:{container_root}:ro")
+            result.warnings.append(guidance)
+            print(f"  [#32] {guidance}")
+
+        return result
 
     ColdStartOptimizer.discover_project = _patched_discover
 
@@ -711,7 +747,7 @@ def _patch_prevent_default_embedding():
             except ImportError:
                 pass
         if patched:
-            print(f"  [#24] DEFAULT_MODEL → '{model_name}' in: {', '.join(patched)}")
+            print(f"  [#24] DEFAULT_MODEL -> '{model_name}' in: {', '.join(patched)}")
 
     # server.py:140 hardcodes SentenceTransformer("all-MiniLM-L6-v2") as a string literal.
     # DEFAULT_MODEL patching doesn't help there. We intercept SentenceTransformer to either:
@@ -758,7 +794,7 @@ def _patch_prevent_default_embedding():
                 if actual in _singleton_cache:
                     return _singleton_cache[actual]
                 if actual != model_name_or_path:
-                    print(f"  [#24] '{model_name_or_path}' → '{actual}'")
+                    print(f"  [#24] '{model_name_or_path}' -> '{actual}'")
                 instance = _original_st_class(actual, **kwargs)
                 _singleton_cache[actual] = instance
                 return instance
@@ -778,6 +814,157 @@ def _patch_prevent_default_embedding():
         except ImportError:
             pass
     print(f"  [#24] SentenceTransformer intercepted — all loads use '{model_name}'")
+
+
+def _patch_ttl_days_zero(server):
+    """Fix ttl_days=0 being ignored due to falsy check in tool closure.
+
+    Fixes GitHub issue #31: upstream facts.py:75 uses `if ttl_days:` which
+    treats 0 as falsy. ttl_days=0 should mean 'expires immediately'.
+
+    Must run AFTER create_server() because the bug is in a tool closure.
+    """
+    from rlm_toolkit.memory_bridge.v2.hierarchical import TTLConfig, TTLAction, MemoryLevel
+
+    store = server.memory_bridge_v2_store
+
+    # Try MCP SDK v1 handler dict
+    handlers = getattr(server.mcp, "_tool_handlers", None)
+    if handlers and "rlm_add_hierarchical_fact" in handlers:
+        _original_handler = handlers["rlm_add_hierarchical_fact"]
+
+        async def _patched_handler(
+            content: str,
+            level: int = 0,
+            domain=None,
+            module=None,
+            code_ref=None,
+            parent_id=None,
+            ttl_days=None,
+        ):
+            ttl_config = None
+            if ttl_days is not None:
+                ttl_config = TTLConfig(
+                    ttl_seconds=ttl_days * 24 * 3600,
+                    on_expire=TTLAction.MARK_STALE,
+                )
+            try:
+                fact_id = store.add_fact(
+                    content=content,
+                    level=MemoryLevel(level),
+                    domain=domain,
+                    module=module,
+                    code_ref=code_ref,
+                    parent_id=parent_id,
+                    ttl_config=ttl_config,
+                    source="manual",
+                    confidence=1.0,
+                )
+                return {
+                    "status": "success",
+                    "fact_id": fact_id,
+                    "content": content,
+                    "level": MemoryLevel(level).name,
+                    "domain": domain,
+                    "module": module,
+                }
+            except Exception as e:
+                return {"status": "error", "message": str(e)}
+
+        handlers["rlm_add_hierarchical_fact"] = _patched_handler
+        print("  [#31] Patched rlm_add_hierarchical_fact: ttl_days=0 now creates TTL")
+        return
+
+    # Try MCP SDK v2+ tool manager
+    tool_manager = getattr(server.mcp, "_tool_manager", None)
+    if tool_manager and hasattr(tool_manager, "_tools"):
+        tools_dict = tool_manager._tools
+        if "rlm_add_hierarchical_fact" in tools_dict:
+            tool_entry = tools_dict["rlm_add_hierarchical_fact"]
+            if hasattr(tool_entry, 'fn'):
+                async def _patched_fn(
+                    content: str,
+                    level: int = 0,
+                    domain=None,
+                    module=None,
+                    code_ref=None,
+                    parent_id=None,
+                    ttl_days=None,
+                ):
+                    ttl_config = None
+                    if ttl_days is not None:
+                        ttl_config = TTLConfig(
+                            ttl_seconds=ttl_days * 24 * 3600,
+                            on_expire=TTLAction.MARK_STALE,
+                        )
+                    try:
+                        fact_id = store.add_fact(
+                            content=content,
+                            level=MemoryLevel(level),
+                            domain=domain,
+                            module=module,
+                            code_ref=code_ref,
+                            parent_id=parent_id,
+                            ttl_config=ttl_config,
+                            source="manual",
+                            confidence=1.0,
+                        )
+                        return {
+                            "status": "success",
+                            "fact_id": fact_id,
+                            "content": content,
+                            "level": MemoryLevel(level).name,
+                            "domain": domain,
+                            "module": module,
+                        }
+                    except Exception as e:
+                        return {"status": "error", "message": str(e)}
+
+                tool_entry.fn = _patched_fn
+                print("  [#31] Patched rlm_add_hierarchical_fact (v2): ttl_days=0 now creates TTL")
+                return
+
+    print("  [#31] WARNING: Cannot patch rlm_add_hierarchical_fact — no handler found")
+
+
+def _patch_format_context():
+    """Filter noise from format_context_for_injection output.
+
+    Fixes GitHub issue #33: route_context returns repeated 'Unknown project' lines
+    and __FINGERPRINT__ data from L0 facts. The noise appears in the formatted string
+    produced by format_context_for_injection(), not in route() which returns RoutingResult.
+    """
+    try:
+        from rlm_toolkit.memory_bridge.v2.router import SemanticRouter
+    except ImportError:
+        print("  [#33] Cannot patch format_context — SemanticRouter import failed")
+        return
+
+    _original_format = SemanticRouter.format_context_for_injection
+
+    def _patched_format(self, routing_result, include_metadata=True):
+        # Filter noisy facts from routing_result before formatting
+        clean_facts = []
+        seen_content = set()
+        for fact in routing_result.facts:
+            content = fact.content.strip()
+            if content.startswith("__FINGERPRINT__:"):
+                continue
+            if "is a Unknown project" in content:
+                continue
+            if content == "Unknown project":
+                continue
+            # Deduplicate identical content
+            if content in seen_content:
+                continue
+            seen_content.add(content)
+            clean_facts.append(fact)
+
+        routing_result.facts = clean_facts
+        return _original_format(self, routing_result, include_metadata=include_metadata)
+
+    SemanticRouter.format_context_for_injection = _patched_format
+    print("  [#33] Patched format_context_for_injection: filtering noise from L0 facts")
 
 
 def main():
@@ -805,11 +992,19 @@ def main():
 
     server = create_server()
 
+    # Wire v2 store to manager for hybrid_search (#19 reliability)
+    if hasattr(server, 'memory_bridge') and hasattr(server, 'memory_bridge_v2_store'):
+        server.memory_bridge._v2_store = server.memory_bridge_v2_store
+
     # Apply embedding override AFTER creating server (instance-level patch)
     _patch_embedding(server)
 
     # Filter tools to allowed set (if RLM_TOOLS env var is set)
     _filter_tools(server)
+
+    # Post-creation patches — must run after create_server() and _filter_tools()
+    _patch_ttl_days_zero(server)      # #31
+    _patch_format_context()           # #33
 
     server.mcp.settings.host = args.host
     server.mcp.settings.port = args.port

@@ -6,7 +6,7 @@ WORKDIR /app
 RUN pip install --no-cache-dir \
     torch --index-url https://download.pytorch.org/whl/cpu && \
     pip install --no-cache-dir \
-    "rlm-toolkit[all]==2.3.1"
+    "rlm-toolkit[all]==2.3.1" watchdog
 
 # Data directory for persistent storage
 RUN mkdir -p /data
