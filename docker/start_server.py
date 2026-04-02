@@ -1070,7 +1070,15 @@ def _check_and_reindex_embeddings(server):
     current_model = os.environ.get("RLM_EMBEDDING_MODEL", "all-MiniLM-L6-v2")
 
     if not embedder:
-        print("  [#37] No embedder available — skipping reindex check")
+        print("  [#37] No embedder available — skipping reindex check", flush=True)
+        return
+
+    # Verify embedder is real (not a stub from #24 patch for ollama/openai)
+    embedder_type = type(embedder).__name__
+    inner_type = type(getattr(embedder, '_model', embedder)).__name__
+    print(f"  [#37] Embedder: {embedder_type} (inner: {inner_type})", flush=True)
+    if inner_type == '_StubEmbedder':
+        print("  [#37] Embedder is a stub — skipping reindex (will use real embedder at runtime)", flush=True)
         return
 
     try:
@@ -1127,18 +1135,20 @@ def _check_and_reindex_embeddings(server):
                 conn.commit()
             return
 
-        print(f"  [#37] Reindexing {len(facts)} facts with model '{current_model}'...")
+        print(f"  [#37] Reindexing {len(facts)} facts with model '{current_model}'...", flush=True)
         reindexed = 0
         failed = 0
-        for fact_id, content in facts:
+        for i, (fact_id, content) in enumerate(facts):
             try:
                 raw = embedder.encode(content)
                 embedding = raw.tolist() if hasattr(raw, 'tolist') else list(raw)
                 store.update_embedding(fact_id, embedding, model_name=current_model)
                 reindexed += 1
+                if (i + 1) % 50 == 0:
+                    print(f"  [#37] Reindex progress: {i + 1}/{len(facts)}", flush=True)
             except Exception as e:
                 failed += 1
-                print(f"  [#37] Failed to reindex {fact_id}: {e}")
+                print(f"  [#37] Failed to reindex {fact_id}: {e}", flush=True)
 
         # Codex F-1: only clear marker and record model if ALL facts were reindexed.
         # If any failed, leave marker so next boot retries the full reindex.
