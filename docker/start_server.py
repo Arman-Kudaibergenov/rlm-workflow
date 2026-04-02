@@ -15,6 +15,9 @@ Applies monkey-patches for:
 - #31: ttl_days=0 falsy check — patch tool closure after create_server()
 - #33: route_context noise — filter __FINGERPRINT__ and Unknown project from format output
 - #34: search_facts min_score threshold — filter garbage results below 0.45
+- #36: search_facts min_score=0.55 too high — lower to 0.1, _is_noise() handles garbage
+- #37: embedding model switch silently breaks search — detect mismatch and reindex on startup
+- #38: recency boost alone passes min_score for irrelevant results — add min_relevance gate
 """
 
 import argparse
@@ -402,6 +405,11 @@ def _patch_search_facts():
     Fixes GitHub issue #19: search_facts returns empty because v1 manager.hybrid_search()
     looks at v1 _current_state.facts, but rlm_add_hierarchical_fact stores facts in v2 store.
     This patch makes hybrid_search query the v2 store directly.
+
+    Additional fixes:
+    - #36: min_score lowered from 0.55 to 0.1 so PENDING facts are found
+    - #38: min_relevance gate — require semantic+keyword relevance before recency boost
+           prevents fresh garbage from passing threshold on recency alone
     """
     import math
     from datetime import datetime
@@ -462,6 +470,18 @@ def _patch_search_facts():
         now = datetime.now()
         scored = []
 
+        # #38 fix: minimum relevance gate (weighted semantic + keyword, before recency)
+        # Prevents fresh but irrelevant facts from passing on recency alone.
+        # Uses weighted values to respect caller's weight choices (Codex F-4).
+        #
+        # Challenge: multilingual MiniLM has cosine baseline 0.1-0.4 for RANDOM text
+        # (cross-language similarity floor). So raw semantic alone can't gate noise.
+        # Strategy: require EITHER keyword overlap OR high semantic similarity.
+        # - min_semantic: cosine threshold for "actually related" (0.5 = real match)
+        # - Any keyword overlap (Jaccard > 0) automatically qualifies
+        # - Below both thresholds: recency-only match, skip it
+        min_semantic = float(os.environ.get("RLM_MIN_SEMANTIC", "0.5"))
+
         def _cosine(a, b):
             import numpy as np
             a, b = np.array(a), np.array(b)
@@ -480,12 +500,25 @@ def _patch_search_facts():
             if getattr(fact, 'is_stale', False) or _is_noise(fact):
                 continue
             semantic = _cosine(query_embedding, emb) if query_embedding and emb else 0.0
+            # Clamp negative cosine to 0 (cross-model noise, Codex F-4)
+            semantic = max(0.0, semantic)
             fact_tokens = set(fact.content.lower().split())
             union_size = len(query_tokens | fact_tokens)
             keyword = len(query_tokens & fact_tokens) / max(union_size, 1)
+
+            # #38: relevance gate — require keyword overlap OR strong semantic match
+            # Multilingual models have cosine floor ~0.1-0.4 for unrelated text,
+            # so a flat min_relevance threshold doesn't work. Instead:
+            # - keyword > 0 (any word overlap) → relevant
+            # - semantic >= min_semantic (e.g. 0.5) → relevant
+            # - neither → skip (recency alone can't qualify)
+            if keyword == 0 and semantic < min_semantic:
+                continue
+
+            relevance = semantic_weight * semantic + keyword_weight * keyword
             age_hours = (now - fact.created_at).total_seconds() / 3600
             recency = math.exp(-age_hours / 168)
-            score = semantic_weight * semantic + keyword_weight * keyword + recency_weight * recency
+            score = relevance + recency_weight * recency
             scored.append((fact, score))
 
         # Also score facts without embeddings (keyword + recency only)
@@ -498,18 +531,26 @@ def _patch_search_facts():
             fact_tokens = set(fact.content.lower().split())
             union_size = len(query_tokens | fact_tokens)
             keyword = len(query_tokens & fact_tokens) / max(union_size, 1)
+
+            # #38: relevance gate for non-embedded facts — keyword only, no semantic
+            # Without embeddings, require at least some keyword overlap
+            if keyword == 0:
+                continue
+
+            relevance = keyword_weight * keyword
             age_hours = (now - fact.created_at).total_seconds() / 3600
             recency = math.exp(-age_hours / 168)
-            score = keyword_weight * keyword + recency_weight * recency
+            score = relevance + recency_weight * recency
             scored.append((fact, score))
 
-        # Wrap v2 facts with v1-compatible attributes for serialization
-        min_score = float(os.environ.get("RLM_MIN_SCORE", "0.55"))
+        # #36: min_score lowered from 0.55 to 0.1 — _is_noise() handles garbage,
+        # min_relevance gate handles recency-only boosted noise (#38)
+        min_score = float(os.environ.get("RLM_MIN_SCORE", "0.1"))
         result = sorted(scored, key=lambda x: -x[1])[:top_k]
         result = [(fact, score) for fact, score in result if score >= min_score]
+        # Wrap v2 facts with v1-compatible attributes for serialization
         for fact, _ in result:
             if not hasattr(fact, 'entity_type'):
-                # Add v1-compatible shim: entity_type with .value
                 class _EntityShim:
                     def __init__(self, val):
                         self.value = val
@@ -967,6 +1008,159 @@ def _patch_format_context():
     print("  [#33] Patched format_context_for_injection: filtering noise from L0 facts")
 
 
+def _patch_embedding_write_path(server):
+    """Patch add_fact to write model_name into embeddings_index.
+
+    Fixes GitHub issue #37 (Codex F-1 BLOCKER): upstream add_fact writes to
+    embeddings_index without model_name, so SQLite uses DEFAULT 'all-MiniLM-L6-v2'
+    even when a different model is active. This causes silent model mismatch after
+    new facts are added with one model and searched with another.
+    """
+    import json
+    import sqlite3
+
+    store = server.memory_bridge_v2_store
+    model_name = os.environ.get("RLM_EMBEDDING_MODEL", "all-MiniLM-L6-v2")
+
+    _original_add_fact = store.add_fact
+
+    def _patched_add_fact(content, level=None, domain=None, module=None,
+                          code_ref=None, parent_id=None, ttl_config=None,
+                          embedding=None, confidence=1.0, source="manual",
+                          session_id=None, **kwargs):
+        """Wrapper that fixes model_name in embeddings_index after upstream add_fact."""
+        fact_id = _original_add_fact(
+            content=content, level=level, domain=domain, module=module,
+            code_ref=code_ref, parent_id=parent_id, ttl_config=ttl_config,
+            embedding=embedding, confidence=confidence, source=source,
+            session_id=session_id, **kwargs,
+        )
+        # Fix: update model_name for the newly inserted embedding row
+        try:
+            with sqlite3.connect(store.db_path) as conn:
+                conn.execute(
+                    "UPDATE embeddings_index SET model_name = ? WHERE fact_id = ? AND model_name != ?",
+                    (model_name, fact_id, model_name),
+                )
+        except Exception as e:
+            print(f"  [#37] Failed to update model_name for {fact_id}: {e}")
+        return fact_id
+
+    store.add_fact = _patched_add_fact
+    print(f"  [#37] Patched add_fact: embeddings_index.model_name = '{model_name}'")
+
+
+def _check_and_reindex_embeddings(server):
+    """Detect embedding model mismatch and reindex all facts on startup.
+
+    Fixes GitHub issue #37: after switching RLM_EMBEDDING_MODEL, old embeddings
+    remain in a different vector space. Cosine similarity across spaces is meaningless.
+
+    Safety (Codex F-3): uses a 'reindex_in_progress' marker in schema_info.
+    If startup was interrupted mid-reindex, next boot detects the marker and retries.
+    Model name marker is written AFTER successful reindex, so partial reindex
+    forces a full retry on next boot.
+    """
+    import json
+    import sqlite3
+    from datetime import datetime
+
+    store = server.memory_bridge_v2_store
+    embedder = getattr(store, '_embedder', None)
+    current_model = os.environ.get("RLM_EMBEDDING_MODEL", "all-MiniLM-L6-v2")
+
+    if not embedder:
+        print("  [#37] No embedder available — skipping reindex check")
+        return
+
+    try:
+        with sqlite3.connect(store.db_path) as conn:
+            # Check for interrupted reindex from previous boot
+            in_progress = conn.execute(
+                "SELECT value FROM schema_info WHERE key = 'reindex_in_progress'"
+            ).fetchone()
+            if in_progress:
+                print(f"  [#37] Previous reindex was interrupted — forcing full reindex")
+
+            # Check what model the existing embeddings were created with
+            row = conn.execute(
+                "SELECT DISTINCT model_name FROM embeddings_index LIMIT 5"
+            ).fetchall()
+            existing_models = {r[0] for r in row} if row else set()
+
+            needs_reindex = bool(in_progress)
+            if existing_models and existing_models != {current_model}:
+                stale_count = conn.execute(
+                    "SELECT COUNT(*) FROM embeddings_index WHERE model_name != ?",
+                    (current_model,),
+                ).fetchone()[0]
+                if stale_count > 0:
+                    print(f"  [#37] Model mismatch: {existing_models} != {{{current_model}}} "
+                          f"({stale_count} stale embeddings)")
+                    needs_reindex = True
+
+            if not needs_reindex:
+                return
+
+            # Mark reindex in progress (Codex F-3: crash safety)
+            conn.execute(
+                "INSERT OR REPLACE INTO schema_info (key, value) VALUES ('reindex_in_progress', ?)",
+                (datetime.now().isoformat(),),
+            )
+            conn.commit()
+
+        # Get all facts that need reindexing
+        with sqlite3.connect(store.db_path) as conn:
+            facts = conn.execute(
+                "SELECT id, content FROM hierarchical_facts WHERE is_archived = 0"
+            ).fetchall()
+
+        if not facts:
+            print("  [#37] No facts to reindex — clearing marker")
+            # Codex F-1: clear stuck marker when no facts exist
+            with sqlite3.connect(store.db_path) as conn:
+                conn.execute("DELETE FROM schema_info WHERE key = 'reindex_in_progress'")
+                conn.execute(
+                    "INSERT OR REPLACE INTO schema_info (key, value) VALUES ('embedding_model', ?)",
+                    (current_model,),
+                )
+                conn.commit()
+            return
+
+        print(f"  [#37] Reindexing {len(facts)} facts with model '{current_model}'...")
+        reindexed = 0
+        failed = 0
+        for fact_id, content in facts:
+            try:
+                raw = embedder.encode(content)
+                embedding = raw.tolist() if hasattr(raw, 'tolist') else list(raw)
+                store.update_embedding(fact_id, embedding, model_name=current_model)
+                reindexed += 1
+            except Exception as e:
+                failed += 1
+                print(f"  [#37] Failed to reindex {fact_id}: {e}")
+
+        # Codex F-1: only clear marker and record model if ALL facts were reindexed.
+        # If any failed, leave marker so next boot retries the full reindex.
+        if failed > 0:
+            print(f"  [#37] Reindex INCOMPLETE: {reindexed}/{len(facts)} ok, {failed} failed — "
+                  f"marker kept for retry on next boot")
+        else:
+            with sqlite3.connect(store.db_path) as conn:
+                conn.execute("DELETE FROM schema_info WHERE key = 'reindex_in_progress'")
+                conn.execute(
+                    "INSERT OR REPLACE INTO schema_info (key, value) VALUES ('embedding_model', ?)",
+                    (current_model,),
+                )
+                conn.commit()
+            print(f"  [#37] Reindex complete: {reindexed}/{len(facts)} facts updated")
+
+    except Exception as e:
+        print(f"  [#37] Reindex check failed: {e}")
+        import traceback
+        traceback.print_exc()
+
+
 def main():
     parser = argparse.ArgumentParser(description="RLM-Toolkit MCP server launcher")
     parser.add_argument("--host", default="0.0.0.0")
@@ -998,6 +1192,12 @@ def main():
 
     # Apply embedding override AFTER creating server (instance-level patch)
     _patch_embedding(server)
+
+    # #37: detect model mismatch and reindex — AFTER _patch_embedding (needs patched embedder)
+    _check_and_reindex_embeddings(server)
+
+    # #37: patch write path so new facts get correct model_name in embeddings_index
+    _patch_embedding_write_path(server)
 
     # Filter tools to allowed set (if RLM_TOOLS env var is set)
     _filter_tools(server)
