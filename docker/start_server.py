@@ -18,6 +18,8 @@ Applies monkey-patches for:
 - #36: search_facts min_score=0.55 too high — lower to 0.1, _is_noise() handles garbage
 - #37: embedding model switch silently breaks search — detect mismatch and reindex on startup
 - #38: recency boost alone passes min_score for irrelevant results — add min_relevance gate
+- #40: fact_id consistency — normalize id → fact_id in get_facts_by_domain and get_stale_facts
+- #41: enterprise_context description — remove misleading 'Zero configuration'
 """
 
 import argparse
@@ -1171,6 +1173,96 @@ def _check_and_reindex_embeddings(server):
         traceback.print_exc()
 
 
+def _patch_fact_id_consistency(server):
+    """Normalize fact identifier key to 'fact_id' in all tool responses.
+
+    Fixes GitHub issue #40: rlm_get_facts_by_domain and rlm_get_stale_facts
+    return 'id' while other tools return 'fact_id'. Agents chaining calls
+    get KeyError when accessing fact_id uniformly.
+
+    Both 'id' and 'fact_id' are included for backward compatibility.
+    Must run AFTER create_server().
+    """
+    import functools
+
+    tool_manager = getattr(server.mcp, "_tool_manager", None)
+    if not tool_manager or not hasattr(tool_manager, "_tools"):
+        print("  [#40] WARNING: Cannot patch fact_id consistency — no tool manager found")
+        return
+
+    tools_dict = tool_manager._tools
+    patched = []
+
+    for tool_name, list_key in [
+        ("rlm_get_facts_by_domain", "facts"),
+        ("rlm_get_stale_facts", "stale_facts"),
+    ]:
+        if tool_name not in tools_dict:
+            continue
+
+        tool_entry = tools_dict[tool_name]
+        original_fn = tool_entry.fn
+
+        def _make_wrapper(orig, key):
+            @functools.wraps(orig)
+            async def _wrapper(*args, **kwargs):
+                result = await orig(*args, **kwargs)
+                if not isinstance(result, dict):
+                    return result
+                if result.get("status") != "success":
+                    return result
+                items = result.get(key)
+                if not isinstance(items, list):
+                    return result
+                for item in items:
+                    if isinstance(item, dict) and "id" in item:
+                        item["fact_id"] = item["id"]
+                return result
+            return _wrapper
+
+        tool_entry.fn = _make_wrapper(original_fn, list_key)
+        patched.append(tool_name)
+
+    if patched:
+        print(f"  [#40] Patched {' + '.join(patched)}: id → fact_id")
+    else:
+        print("  [#40] WARNING: No tools found to patch for fact_id consistency")
+
+
+def _patch_enterprise_context_description(server):
+    """Fix misleading 'Zero configuration' in enterprise_context description.
+
+    Fixes GitHub issue #41: description says 'Zero configuration' but query
+    parameter is required. AI agents read the description, call without query,
+    and get a validation error.
+
+    Must run AFTER create_server().
+    """
+    tool_manager = getattr(server.mcp, "_tool_manager", None)
+    if not tool_manager or not hasattr(tool_manager, "_tools"):
+        print("  [#41] WARNING: Cannot patch enterprise_context description — no tool manager found")
+        return
+
+    tools_dict = tool_manager._tools
+    if "rlm_enterprise_context" not in tools_dict:
+        print("  [#41] WARNING: rlm_enterprise_context not found in tool registry")
+        return
+
+    tool_entry = tools_dict["rlm_enterprise_context"]
+    old_desc = tool_entry.description or ""
+
+    new_desc = old_desc.replace("Zero configuration. ", "Requires a query string. ")
+    if new_desc == old_desc:
+        # Fallback: description may have slightly different formatting
+        new_desc = old_desc.replace("Zero configuration.", "Requires a query string.")
+
+    if new_desc != old_desc:
+        tool_entry.description = new_desc
+        print(f"  [#41] Patched rlm_enterprise_context: removed 'Zero configuration' from description")
+    else:
+        print(f"  [#41] WARNING: 'Zero configuration' not found in description, no change applied")
+
+
 def main():
     parser = argparse.ArgumentParser(description="RLM-Toolkit MCP server launcher")
     parser.add_argument("--host", default="0.0.0.0")
@@ -1215,6 +1307,8 @@ def main():
     # Post-creation patches — must run after create_server() and _filter_tools()
     _patch_ttl_days_zero(server)      # #31
     _patch_format_context()           # #33
+    _patch_fact_id_consistency(server)          # #40
+    _patch_enterprise_context_description(server)  # #41
 
     server.mcp.settings.host = args.host
     server.mcp.settings.port = args.port

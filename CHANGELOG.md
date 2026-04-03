@@ -2,6 +2,16 @@
 
 This file documents all modifications made to the original [RLM-Toolkit](https://github.com/DmitrL-dev/AISecurity/tree/main/rlm-toolkit) by Dmitry Labintcev.
 
+## v1.4.0 (2026-04-03)
+
+### Bug Fixes
+- **#40**: `rlm_get_facts_by_domain` and `rlm_get_stale_facts` now return `fact_id` in each fact dict (consistent with all other tools). Both `id` and `fact_id` are present for backward compatibility.
+- **#41**: `rlm_enterprise_context` description no longer says "Zero configuration" — updated to indicate `query` parameter is required.
+
+### Other
+- Added `VERSION` file (v1.4.0)
+- Added `tests/test_regression_40.py` — 14 test cases for #40/#41
+
 ## Workflow Layer (CLAUDE.md rituals)
 
 ### `суммаризируем` / `summarize` ritual
