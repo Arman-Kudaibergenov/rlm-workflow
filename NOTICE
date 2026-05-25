@@ -1,10 +1,22 @@
 RLM Workflow for Claude Code
-Copyright 2026 (Your Name / Organization)
+Copyright (C) 2026 Arman Kudaibergenov
+https://github.com/Arman-Kudaibergenov/rlm-workflow
+
+This program is free software: you can redistribute it and/or modify it
+under the terms of the GNU Affero General Public License version 3.
+
+For commercial licensing inquiries:
+  arman.kudaibergenov.mail@gmail.com
+
+----------------------------------------------------------------------
 
 This product is based on RLM-Toolkit:
   Copyright 2024-2026 Dmitry Labintcev (DmitrL-dev)
   https://github.com/DmitrL-dev/AISecurity/tree/main/rlm-toolkit
   Licensed under the Apache License, Version 2.0
 
-This product includes software developed by the RLM-Toolkit project
-and redistributed under the Apache License 2.0.
+This product includes software developed by the RLM-Toolkit project,
+incorporated under the Apache License 2.0 — its terms continue to apply
+to that portion of the code. The combined work is distributed under the
+GNU Affero General Public License version 3, as permitted by Apache-2.0
+license compatibility with AGPL-3.0.

@@ -141,4 +141,4 @@ curl -o CLAUDE.md https://raw.githubusercontent.com/Arman-Kudaibergenov/rlm-work
 
 ## Лицензия
 
-[Apache License 2.0](LICENSE) — как и оригинальный RLM-Toolkit.
+[AGPL-3.0](LICENSE) — combined work. RLM-Toolkit portions remain under Apache-2.0 (см. [NOTICE](NOTICE)).
