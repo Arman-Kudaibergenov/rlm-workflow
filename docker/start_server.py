@@ -20,6 +20,12 @@ Applies monkey-patches for:
 - #38: recency boost alone passes min_score for irrelevant results — add min_relevance gate
 - #40: fact_id consistency — normalize id → fact_id in get_facts_by_domain and get_stale_facts
 - #41: enterprise_context description — remove misleading 'Zero configuration'
+- #42: rlm_diff tool + freshness dates in routing output + stale/archive timestamps
+- #43: card-text embeddings, FTS5+RRF hybrid routing, bge-reranker re-ordering
+- #44: agent loadout profiles (dev-1c/em/infra) + rlm_list_profiles
+- #45: bi-temporal validity windows (valid_from/valid_until), as_of queries, invalidate
+- #46: L2/L3 RRF weight + tiered FTS (rare-token/AND/OR) + rank-order output
+- #47: revisor — autonomous freshness (TTL rules + endpoint ping + optional LLM)
 """
 
 import argparse
@@ -357,6 +363,48 @@ _DEFAULT_TOOLS = {
     "rlm_discover_project",
     "rlm_enterprise_context",
     "rlm_get_facts_by_domain",
+    "rlm_diff",
+    "rlm_list_profiles",
+    "rlm_invalidate_fact",
+    "rlm_list_inactive",
+    "rlm_revisor_run",
+}
+
+
+# Agent loadout profiles (#44) — domain subsets per agent role.
+# Domains are REAL values from hierarchical_facts (checked 2026-08-2, 43 distinct).
+# Routing effect: facts in profile domains get RRF score x2.0, others x0.5
+# (down-weighted, NOT excluded). Unknown profile -> default + warning field.
+_AGENT_PROFILES = {
+    "dev-1c": {
+        "description": "1C/BSL developer: code fixes, pitfalls, farm deploys",
+        # spec asked code/pitfalls/farm/infrastructure/tasks; real base has no
+        # 'code'/'farm' domains — code-ish = validation/testing/implementation,
+        # farm-ish = deploy/deployment
+        "domains": [
+            "pitfalls", "deploy", "deployment", "infrastructure", "tasks",
+            "validation", "testing", "testing-ui", "implementation",
+            "integrations", "1c-ai-testing", "investigation", "reference", "spec",
+        ],
+    },
+    "em": {
+        "description": "Engineering manager: projects, decisions, current work",
+        "domains": [
+            "work_map", "work_current", "work_context", "project",
+            "project_status", "process", "retrospective", "reviews",
+            "feedback", "team", "tasks", "user",
+        ],
+    },
+    "infra": {
+        "description": "Infra/ops: servers, network, security, licensing",
+        "domains": [
+            "infrastructure", "security", "security-audit", "licensing", "pitfalls",
+        ],
+    },
+    "default": {
+        "description": "No domain bias (previous behavior)",
+        "domains": [],
+    },
 }
 
 
@@ -1263,6 +1311,1413 @@ def _patch_enterprise_context_description(server):
         print(f"  [#41] WARNING: 'Zero configuration' not found in description, no change applied")
 
 
+def _patch_freshness_and_diff(server):
+    """Freshness dates in routing output + rlm_diff tool + stale/archive timestamps.
+
+    Change #42 (2026-08-02):
+    1. rlm_route_context / rlm_enterprise_context: every fact line gets a
+       [YYYY-MM-DD] created_at prefix and a [STALE] flag, so the agent sees
+       freshness without a separate call. Noise filtering from #23/#33
+       (fingerprint / 'Unknown project' / duplicates) is preserved.
+    2. New MCP tool rlm_diff(since, include_archived, limit, offset): facts
+       created/updated/staled after `since`, grouped by change type.
+    3. mark_stale / archive_fact now stamp valid_until (COALESCE — keeps a
+       real expiry if set), so future stale/archive events are visible
+       to rlm_diff. The DB has no other timestamp for these events.
+    """
+    import re
+    import sqlite3
+    from datetime import datetime, timedelta
+
+    from rlm_toolkit.memory_bridge.v2.hierarchical import (
+        HierarchicalMemoryStore,
+        MemoryLevel,
+    )
+    from rlm_toolkit.memory_bridge.v2.router import SemanticRouter
+    from rlm_toolkit.memory_bridge.v2.automode import EnterpriseContext
+
+    _DATE_PREFIX_RE = re.compile(r"^\s*\[\d{4}-\d{2}-\d{2}\]")
+
+    def _fact_date(fact):
+        ca = getattr(fact, "created_at", None)
+        if not ca:
+            return ""
+        return ca[:10] if isinstance(ca, str) else str(ca)[:10]
+
+    def _is_noise_content(content):
+        c = content.strip()
+        return (c.startswith("__FINGERPRINT__:")
+                or "is a Unknown project" in c
+                or c == "Unknown project")
+
+    def _fmt_fact_line(fact, with_domain=True):
+        """Fact line with freshness prefix: '- [date] [L2] [STALE] [domain] content'."""
+        parts = []
+        content = fact.content
+        date = _fact_date(fact)
+        if date and not _DATE_PREFIX_RE.match(content):
+            parts.append(f"[{date}]")
+        lvl = getattr(fact, "level", None)
+        lvl_val = getattr(lvl, "value", lvl)
+        if lvl_val and lvl_val >= 2:
+            parts.append(f"[L{lvl_val}]")
+        if getattr(fact, "is_stale", False):
+            parts.append("[STALE]")
+        if with_domain and getattr(fact, "domain", None):
+            parts.append(f"[{fact.domain}]")
+        parts.append(content)
+        return "- " + " ".join(parts)
+
+    # --- 1a. route_context formatter (replaces original + #33 wrapper) ---
+    def _patched_format_fresh(self, routing_result, include_metadata=True):
+        # #46: L0 keeps its own section, everything else prints in RANK order
+        # (the order route() selected facts = RRF relevance). Upstream grouped
+        # by level, which buried top-ranked L2/L3 facts under any L1s.
+        l0_facts = []
+        ranked = []
+        seen_content = set()
+        for fact in routing_result.facts:
+            c = fact.content.strip()
+            if _is_noise_content(c) or c in seen_content:
+                continue
+            seen_content.add(c)
+            if fact.level == MemoryLevel.L0_PROJECT:
+                l0_facts.append(fact)
+            else:
+                ranked.append(fact)
+
+        lines = []
+        if l0_facts:
+            if include_metadata:
+                lines.append("\n## PROJECT OVERVIEW")
+            for fact in l0_facts:
+                lines.append(_fmt_fact_line(fact))
+        if ranked:
+            if include_metadata:
+                lines.append("\n## ROUTED FACTS (by relevance)")
+            for fact in ranked:
+                lines.append(_fmt_fact_line(fact))
+
+        if include_metadata:
+            lines.append("\n---")
+            lines.append(f"Routing confidence: {routing_result.routing_confidence:.0%}")
+            lines.append(f"Domains: {', '.join(routing_result.domains_loaded)}")
+        return "\n".join(lines)
+
+    SemanticRouter.format_context_for_injection = _patched_format_fresh
+    print("  [#42] Patched format_context_for_injection: freshness dates + noise filter")
+
+    # --- 1b. enterprise_context formatter (replaces original + #23 wrapper) ---
+    def _patched_inject_fresh(self):
+        parts = []
+
+        overview = self.project_overview or ""
+        if overview and "__FINGERPRINT__" not in overview and "Unknown project" not in overview:
+            parts.append("## Project Overview")
+            parts.append(overview)
+            parts.append("")
+
+        clean_facts = [f for f in self.facts if not _is_noise_content(f.content)]
+        l0_facts = [f for f in clean_facts if f.level == MemoryLevel.L0_PROJECT]
+        l1_facts = [f for f in clean_facts if f.level == MemoryLevel.L1_DOMAIN]
+        l2_facts = [f for f in clean_facts if f.level == MemoryLevel.L2_MODULE]
+
+        if l0_facts:
+            parts.append("## Architecture")
+            for f in l0_facts:
+                parts.append(_fmt_fact_line(f, with_domain=False))
+            parts.append("")
+
+        if l1_facts:
+            parts.append("## Domains")
+            for f in l1_facts:
+                parts.append(_fmt_fact_line(f))
+            parts.append("")
+
+        if l2_facts:
+            parts.append("## Modules")
+            for f in l2_facts[:10]:
+                parts.append(_fmt_fact_line(f, with_domain=False))
+            parts.append("")
+
+        if self.causal_summary:
+            parts.append("## Past Decisions")
+            parts.append(self.causal_summary)
+
+        return "\n".join(parts)
+
+    EnterpriseContext.to_injection_string = _patched_inject_fresh
+    print("  [#42] Patched to_injection_string: freshness dates in enterprise_context")
+
+    # --- 3. Timestamp stale/archive events (valid_until was always NULL) ---
+    def _mark_stale_ts(self, fact_id):
+        with sqlite3.connect(self.db_path) as conn:
+            result = conn.execute(
+                "UPDATE hierarchical_facts SET is_stale = 1, "
+                "valid_until = COALESCE(valid_until, ?) WHERE id = ?",
+                (datetime.now().isoformat(), fact_id),
+            )
+            return result.rowcount > 0
+
+    def _archive_fact_ts(self, fact_id):
+        with sqlite3.connect(self.db_path) as conn:
+            result = conn.execute(
+                "UPDATE hierarchical_facts SET is_archived = 1, "
+                "valid_until = COALESCE(valid_until, ?) WHERE id = ?",
+                (datetime.now().isoformat(), fact_id),
+            )
+            return result.rowcount > 0
+
+    HierarchicalMemoryStore.mark_stale = _mark_stale_ts
+    HierarchicalMemoryStore.archive_fact = _archive_fact_ts
+    print("  [#42] Patched mark_stale/archive_fact: stamp valid_until for rlm_diff")
+
+    # --- 2. rlm_diff tool ---
+    store = getattr(server, "memory_bridge_v2_store", None)
+    if store is None:
+        print("  [#42] WARNING: no v2 store — rlm_diff not registered")
+        return
+    db_path = str(store.db_path)
+
+    def _parse_since(since):
+        s = str(since).strip()
+        m = re.fullmatch(r"(\d+)\s*([hdw])", s.lower())
+        if m:
+            n, unit = int(m.group(1)), m.group(2)
+            delta = {"h": timedelta(hours=n),
+                     "d": timedelta(days=n),
+                     "w": timedelta(weeks=n)}[unit]
+            return datetime.now() - delta
+        try:
+            return datetime.fromisoformat(s)
+        except ValueError:
+            raise ValueError(
+                f"Invalid 'since': {since!r}. Use ISO date/datetime "
+                "or relative like '24h', '7d', '2w'."
+            )
+
+    @server.mcp.tool(
+        name="rlm_diff",
+        description=(
+            "Show what changed in memory since a point in time. "
+            "since: ISO date/datetime or relative '24h', '7d', '2w'. "
+            "Groups: new (created after since), updated (valid_from changed), "
+            "staled (window closed, valid_until after since; falls back to "
+            "created_at for pre-#45 rows). Archived facts are excluded unless "
+            "include_archived=true. Optional as_of (ISO date): keep only facts "
+            "valid at that moment (valid_from <= as_of, window open at as_of) — "
+            "this supersedes the is_archived flag filter. Paginate limit/offset."
+        ),
+    )
+    async def rlm_diff(
+        since: str,
+        include_archived: bool = False,
+        limit: int = 200,
+        offset: int = 0,
+        as_of: str = "",
+    ):
+        """Facts created/updated/staled after `since`, grouped by change type."""
+        try:
+            cutoff = _parse_since(since).isoformat()
+        except ValueError as e:
+            return {"status": "error", "message": str(e)}
+
+        arch = "" if include_archived else " AND is_archived = 0"
+        if as_of:
+            # Bi-temporal (#45): 'knowledge at date X' — temporal predicate
+            # replaces the flag filter
+            try:
+                asof = datetime.fromisoformat(as_of.strip()).isoformat()
+            except ValueError:
+                return {"status": "error",
+                        "message": f"Invalid 'as_of': {as_of!r} (use ISO date)"}
+            arch = (
+                f" AND valid_from <= '{asof}'"
+                f" AND (valid_until IS NULL OR valid_until > '{asof}')"
+            )
+        try:
+            with sqlite3.connect(db_path) as conn:
+                conn.row_factory = sqlite3.Row
+                staled = conn.execute(
+                    "SELECT * FROM hierarchical_facts WHERE is_stale = 1 "
+                    f"AND COALESCE(valid_until, created_at) >= ?{arch}",
+                    (cutoff,),
+                ).fetchall()
+                staled_ids = {r["id"] for r in staled}
+                new = conn.execute(
+                    "SELECT * FROM hierarchical_facts WHERE created_at >= ?"
+                    f"{arch}",
+                    (cutoff,),
+                ).fetchall()
+                # A fact both new and already staled is reported once, in staled
+                new = [r for r in new if r["id"] not in staled_ids]
+                updated = conn.execute(
+                    "SELECT * FROM hierarchical_facts WHERE valid_from > created_at "
+                    f"AND valid_from >= ?{arch}",
+                    (cutoff,),
+                ).fetchall()
+        except Exception as e:
+            return {"status": "error", "message": str(e)}
+
+        def _entry(row):
+            return {
+                "id": row["id"],
+                "level": row["level"],
+                "domain": row["domain"],
+                "created_at": row["created_at"],
+                "stale": bool(row["is_stale"]),
+                "archived": bool(row["is_archived"]),
+                "content": (row["content"] or "")[:160],
+            }
+
+        # Global ordering (newest first) -> paginate -> regroup
+        tagged = ([("staled", r) for r in staled]
+                  + [("new", r) for r in new]
+                  + [("updated", r) for r in updated])
+        tagged.sort(key=lambda t: t[1]["created_at"], reverse=True)
+        total = len(tagged)
+        limit = max(1, min(int(limit), 1000))
+        offset = max(0, int(offset))
+        page = tagged[offset:offset + limit]
+
+        groups = {"new": [], "updated": [], "staled": []}
+        for kind, row in page:
+            groups[kind].append(_entry(row))
+
+        return {
+            "status": "success",
+            "since": cutoff,
+            "as_of": as_of or None,
+            "total_changes": total,
+            "returned": len(page),
+            "offset": offset,
+            "has_more": offset + limit < total,
+            "counts": {
+                "new": len(new),
+                "updated": len(updated),
+                "staled": len(staled),
+            },
+            "groups": groups,
+        }
+
+    print("  [#42] Registered rlm_diff tool")
+
+
+def _patch_hybrid_search(server):
+    """Card-text embeddings on write + FTS5/RRF hybrid routing + reranker.
+
+    Change #43 (2026-08-02), techniques proven in bsl-atlas:
+    1. Card wrapper for embeddings: new facts embed
+       "domain: {d} | level: {l} | title: {first line} | {content}"
+       instead of raw content (atlas: hit@5 0 -> 0.78). Existing facts were
+       re-embedded by docker/migrate_card_embeddings.py (same model, Ollama
+       all-minilm == all-MiniLM-L6-v2, dim 384).
+    2. FTS5 index (facts_fts) over content+domain of live facts, maintained
+       by triggers; route() fuses vector top-50 and BM25 top-50 with
+       weighted RRF (k=60). Single-word queries get w_fts=2.0 (exact match
+       matters more), multi-word stay 1.0/1.0 (vector dominates).
+       Falls back to pure vector ranking if FTS is empty / has no hits.
+    3. Optional bge-reranker-v2-m3 re-ordering of the RRF top-20
+       (POST {RERANK_URL}/rerank, 3s timeout). Env: RERANK_ENABLED (default
+       true), RERANK_URL (default http://127.0.0.1:8400). On any failure
+       the RRF order is kept and the response reports reranked: false.
+    """
+    import json
+    import re
+    import sqlite3
+    import time
+    import urllib.request
+    from datetime import datetime
+
+    from rlm_toolkit.memory_bridge.v2.hierarchical import MemoryLevel
+    from rlm_toolkit.memory_bridge.v2.router import RoutingResult, SemanticRouter
+
+    store = getattr(server, "memory_bridge_v2_store", None)
+    if store is None:
+        print("  [#43] WARNING: no v2 store — hybrid search not patched")
+        return
+    db_path = str(store.db_path)
+
+    RERANK_ENABLED = os.environ.get("RERANK_ENABLED", "true").lower() not in ("0", "false", "no")
+    RERANK_URL = os.environ.get("RERANK_URL", "http://127.0.0.1:8400").rstrip("/")
+    RERANK_TIMEOUT = float(os.environ.get("RERANK_TIMEOUT", "3"))
+    RRF_K = 60
+    TOP_N = 50
+    _LEVEL_BOOST = {2: 1.15, 3: 1.25}  # #46: L2/L3 weight in RRF fusion
+    RERANK_TOP = 10
+    RERANK_COOLDOWN_S = 120  # skip reranker this long after a failure
+
+    # --- 1. Card text for embeddings (KEEP IN SYNC with migrate_card_embeddings.py) ---
+    def _card_text(content, domain=None, level=None, module=None):
+        first = content.strip().splitlines()[0][:120] if content.strip() else ""
+        parts = [f"domain: {domain or 'general'}", f"level: {level if level is not None else 0}"]
+        if module:
+            parts.append(f"module: {module}")
+        if first:
+            parts.append(f"title: {first}")
+        # 1000 chars ~= MiniLM's 256-wordpiece window; longer input is discarded
+        # by the model anyway and rejected by Ollama with HTTP 400
+        return (" | ".join(parts) + " | " + content)[:1000]
+
+    _inner_add_fact = store.add_fact  # may already be wrapped by #37
+
+    def _card_add_fact(content, level=None, domain=None, module=None,
+                       code_ref=None, parent_id=None, ttl_config=None,
+                       embedding=None, confidence=1.0, source="manual",
+                       session_id=None, **kwargs):
+        if embedding is None and getattr(store, "_embedder", None) is not None:
+            try:
+                lvl = level.value if hasattr(level, "value") else (level if level is not None else 0)
+                card = _card_text(content, domain, lvl, module)
+                embedding = store._generate_embedding(card)
+            except Exception as e:
+                print(f"  [#43] card embedding failed, raw fallback: {e}")
+                embedding = None
+        return _inner_add_fact(
+            content=content, level=level, domain=domain, module=module,
+            code_ref=code_ref, parent_id=parent_id, ttl_config=ttl_config,
+            embedding=embedding, confidence=confidence, source=source,
+            session_id=session_id, **kwargs,
+        )
+
+    store.add_fact = _card_add_fact
+    print("  [#43] Patched add_fact: card-text embeddings on write")
+
+    # --- 2. FTS5 index + triggers (idempotent, self-healing) ---
+    def _ensure_fts():
+        with sqlite3.connect(db_path) as conn:
+            conn.execute(
+                "CREATE VIRTUAL TABLE IF NOT EXISTS facts_fts "
+                "USING fts5(content, domain, fact_id UNINDEXED)"
+            )
+            conn.executescript(
+                """
+                CREATE TRIGGER IF NOT EXISTS facts_fts_ai AFTER INSERT ON hierarchical_facts
+                WHEN NEW.is_archived = 0
+                BEGIN
+                    INSERT INTO facts_fts(content, domain, fact_id)
+                    VALUES (NEW.content, COALESCE(NEW.domain, ''), NEW.id);
+                END;
+                CREATE TRIGGER IF NOT EXISTS facts_fts_ad AFTER DELETE ON hierarchical_facts
+                BEGIN
+                    DELETE FROM facts_fts WHERE fact_id = OLD.id;
+                END;
+                CREATE TRIGGER IF NOT EXISTS facts_fts_ac AFTER UPDATE OF content, domain ON hierarchical_facts
+                BEGIN
+                    DELETE FROM facts_fts WHERE fact_id = NEW.id;
+                    INSERT INTO facts_fts(content, domain, fact_id)
+                    SELECT NEW.content, COALESCE(NEW.domain, ''), NEW.id
+                    WHERE NEW.is_archived = 0;
+                END;
+                CREATE TRIGGER IF NOT EXISTS facts_fts_aa AFTER UPDATE OF is_archived ON hierarchical_facts
+                BEGIN
+                    DELETE FROM facts_fts WHERE fact_id = NEW.id;
+                    INSERT INTO facts_fts(content, domain, fact_id)
+                    SELECT NEW.content, COALESCE(NEW.domain, ''), NEW.id
+                    WHERE NEW.is_archived = 0;
+                END;
+                """
+            )
+            live = conn.execute(
+                "SELECT COUNT(*) FROM hierarchical_facts WHERE is_archived = 0"
+            ).fetchone()[0]
+            indexed = conn.execute("SELECT COUNT(*) FROM facts_fts").fetchone()[0]
+            if indexed != live:
+                conn.execute("DELETE FROM facts_fts")
+                conn.execute(
+                    "INSERT INTO facts_fts(content, domain, fact_id) "
+                    "SELECT content, COALESCE(domain, ''), id "
+                    "FROM hierarchical_facts WHERE is_archived = 0"
+                )
+                print(f"  [#43] facts_fts rebuilt: {indexed} -> {live} rows")
+            else:
+                print(f"  [#43] facts_fts OK: {live} live facts indexed")
+
+    try:
+        _ensure_fts()
+    except Exception as e:
+        print(f"  [#43] WARNING: FTS5 setup failed ({e}) — vector-only routing")
+
+    def _query_tokens(query):
+        return re.findall(r"[0-9a-zA-Z_\-.]{2,}", query.lower())[:10]
+
+    def _fts_search(query, limit=TOP_N):
+        """-> (fact_ids, rare_count): BM25 top-N + size of the rare-token tier.
+
+        Tiered matching (#46): multi-token queries first try tier-0 (facts
+        matching the RAREST token, df<=10 — a precise rare hit must not drown
+        in common-token OR noise), then AND (all tokens), then OR fill.
+        Single-token queries go straight to OR. rare_count tells the caller
+        how many leading ids came from tier-0 (they get extra RRF weight,
+        otherwise the L2 level boost overcomes the rare hit — #47 flake).
+        """
+        tokens = _query_tokens(query)
+        if not tokens:
+            return [], 0
+        quoted = ['"' + t.replace('"', "") + '"' for t in tokens]
+        try:
+            with sqlite3.connect(db_path) as conn:
+                out, seen = [], set()
+                rare_n = 0
+                if len(quoted) > 1:
+                    # Tier 0 (#46): facts matching the RAREST query token.
+                    dfs = []
+                    for qt in quoted:
+                        try:
+                            df = conn.execute(
+                                "SELECT COUNT(*) FROM facts_fts WHERE facts_fts MATCH ?",
+                                (qt,),
+                            ).fetchone()[0]
+                        except Exception:
+                            df = 0
+                        dfs.append((df, qt))
+                    rare_df, rare_q = min(dfs)
+                    if 0 < rare_df <= 10:
+                        for r in conn.execute(
+                            "SELECT fact_id FROM facts_fts WHERE facts_fts MATCH ? "
+                            "ORDER BY bm25(facts_fts) LIMIT ?",
+                            (rare_q, limit),
+                        ).fetchall():
+                            out.append(r[0])
+                            seen.add(r[0])
+                        rare_n = len(out)
+                    # Tier 1: high-precision AND — facts matching ALL tokens
+                    if len(out) < limit:
+                        for r in conn.execute(
+                            "SELECT fact_id FROM facts_fts WHERE facts_fts MATCH ? "
+                            "ORDER BY bm25(facts_fts) LIMIT ?",
+                            (" ".join(quoted), limit),
+                        ).fetchall():
+                            if r[0] not in seen:
+                                out.append(r[0])
+                                seen.add(r[0])
+                                if len(out) >= limit:
+                                    break
+                if len(out) < limit:
+                    for r in conn.execute(
+                        "SELECT fact_id FROM facts_fts WHERE facts_fts MATCH ? "
+                        "ORDER BY bm25(facts_fts) LIMIT ?",
+                        (" OR ".join(quoted), limit),
+                    ).fetchall():
+                        if r[0] not in seen:
+                            out.append(r[0])
+                            seen.add(r[0])
+                            if len(out) >= limit:
+                                break
+                return out, rare_n
+        except Exception:
+            return [], 0
+
+    # --- 3. Reranker ---
+    _rerank_state = {"cooldown_until": 0.0}
+
+    def _call_reranker(query, documents, top_k):
+        """-> [(index, score)] or None if unavailable/disabled/cooling down.
+
+        Circuit breaker: one failed call sidelines the reranker for
+        RERANK_COOLDOWN_S seconds, so an overloaded reranker adds latency
+        to at most one request per cooldown window (bge-reranker
+        is CPU-bound and can exceed any sane timeout under load).
+        """
+        if not RERANK_ENABLED or not documents:
+            return None
+        if time.time() < _rerank_state["cooldown_until"]:
+            return None
+        try:
+            payload = json.dumps(
+                {"query": query, "documents": documents, "top_k": top_k}
+            ).encode()
+            req = urllib.request.Request(
+                f"{RERANK_URL}/rerank", data=payload,
+                headers={"Content-Type": "application/json"}, method="POST",
+            )
+            with urllib.request.urlopen(req, timeout=RERANK_TIMEOUT) as resp:
+                data = json.loads(resp.read())
+            return [
+                (item["index"], item.get("score", 0.0))
+                for item in data.get("results", [])
+                if 0 <= item.get("index", -1) < len(documents)
+            ]
+        except Exception as e:
+            _rerank_state["cooldown_until"] = time.time() + RERANK_COOLDOWN_S
+            print(f"  [#43] reranker unavailable ({type(e).__name__}: {e}) — "
+                  f"RRF order kept, cooldown {RERANK_COOLDOWN_S}s")
+            return None
+
+    # --- 2+3. Hybrid route: RRF(vector, FTS) + optional rerank ---
+    def _valid_at(fact, dt):
+        """Bi-temporal check (#45): was this fact valid at moment dt?"""
+        vf = getattr(fact, "valid_from", None) or getattr(fact, "created_at", None)
+        vu = getattr(fact, "valid_until", None)
+        if vf and vf > dt:
+            return False
+        if vu and vu <= dt:
+            return False
+        return True
+
+    def _hybrid_route(self, query, max_tokens=None, include_stale=False,
+                      include_l0=True, target_domains=None, profile=None,
+                      as_of=None):
+        max_tokens = max_tokens or self.max_tokens
+        selected_facts = []
+        total_tokens = 0
+        domains_loaded = []
+        explanations = []
+        reranked = False
+
+        # Agent loadout (#44): validate profile up front
+        profile_domains = None
+        profile_warning = None
+        if profile and profile != "default":
+            prof = _AGENT_PROFILES.get(profile)
+            if prof is None:
+                profile_warning = (
+                    f"unknown profile '{profile}' — default routing used; "
+                    f"see rlm_list_profiles"
+                )
+            elif prof["domains"]:
+                profile_domains = set(prof["domains"])
+
+        # Bi-temporal (#45): as_of = knowledge state at a point in time.
+        # Temporal predicate replaces the is_stale/is_archived flag filters:
+        # valid_from <= as_of AND (valid_until IS NULL OR valid_until > as_of)
+        as_of_dt = None
+        if as_of:
+            try:
+                as_of_dt = datetime.fromisoformat(str(as_of))
+            except ValueError:
+                profile_warning = (
+                    (profile_warning + "; ") if profile_warning else ""
+                ) + f"invalid as_of '{as_of}' — ignored"
+
+        # Step 1: L0 facts always (as_of: temporal window instead of flags)
+        if include_l0:
+            if as_of_dt:
+                l0_facts = [
+                    f for f in self.store.get_facts_by_level(
+                        MemoryLevel.L0_PROJECT,
+                        include_stale=True, include_archived=True,
+                    )
+                    if _valid_at(f, as_of_dt)
+                ]
+            else:
+                l0_facts = self.store.get_facts_by_level(
+                    MemoryLevel.L0_PROJECT, include_stale=include_stale
+                )
+            for fact in l0_facts:
+                tokens = fact.token_estimate()
+                if total_tokens + tokens <= max_tokens * 0.3:
+                    selected_facts.append(fact)
+                    total_tokens += tokens
+            explanations.append(f"Loaded {len(l0_facts)} L0 project facts")
+
+        query_embedding = self.embedding_service.embed(query)
+        facts_with_embeddings = self.store.get_facts_with_embeddings()
+
+        if not facts_with_embeddings:
+            # Upstream fallback: no embeddings at all -> first 10 L1 facts
+            l1_facts = self.store.get_facts_by_level(
+                MemoryLevel.L1_DOMAIN, include_stale=include_stale
+            )
+            for fact in l1_facts[:10]:
+                tokens = fact.token_estimate()
+                if total_tokens + tokens <= max_tokens:
+                    selected_facts.append(fact)
+                    total_tokens += tokens
+                    if fact.domain and fact.domain not in domains_loaded:
+                        domains_loaded.append(fact.domain)
+            result = RoutingResult(
+                facts=selected_facts,
+                total_tokens=total_tokens,
+                routing_confidence=0.5,
+                routing_explanation="Fallback routing (no embeddings): "
+                + "; ".join(explanations),
+                domains_loaded=domains_loaded,
+                fallback_used=True,
+            )
+            result.reranked = False
+            result.profile = profile or "default"
+            result.profile_warning = profile_warning
+            result.as_of = str(as_of) if as_of_dt else None
+            return result
+
+        # Candidate pool — same filters as upstream route();
+        # as_of mode: temporal window (SQL) instead of current flags
+        if as_of_dt:
+            s = as_of_dt.isoformat()
+            with sqlite3.connect(db_path) as conn:
+                conn.row_factory = sqlite3.Row
+                rows = conn.execute(
+                    "SELECT hf.*, ei.embedding AS stored_embedding "
+                    "FROM hierarchical_facts hf "
+                    "JOIN embeddings_index ei ON hf.id = ei.fact_id "
+                    "WHERE hf.valid_from <= ? "
+                    "AND (hf.valid_until IS NULL OR hf.valid_until > ?)",
+                    (s, s),
+                ).fetchall()
+            candidates = [
+                (store._row_to_fact(r),
+                 json.loads(r["stored_embedding"]) if r["stored_embedding"] else [])
+                for r in rows
+            ]
+        else:
+            candidates = facts_with_embeddings
+        pool = []
+        for fact, emb in candidates:
+            if fact.level == MemoryLevel.L0_PROJECT:
+                continue
+            if not as_of_dt:
+                if fact.is_archived:
+                    continue
+                if not include_stale and fact.is_stale:
+                    continue
+            if target_domains and fact.domain and fact.domain not in target_domains:
+                continue
+            pool.append((fact, emb))
+        pool_by_id = {f.id: f for f, _ in pool}
+
+        # Vector ranking (cosine, upstream threshold)
+        sims = {}
+        vec_ranked = []
+        for fact, emb in pool:
+            sim = self._cosine_similarity(query_embedding, emb)
+            if sim >= self.similarity_threshold:
+                sims[fact.id] = sim
+                vec_ranked.append(fact)
+        vec_ranked.sort(key=lambda f: -sims[f.id])
+        vec_top = vec_ranked[:TOP_N]
+
+        # FTS ranking (BM25, tiered); rare-tier ids get extra RRF weight
+        fts_raw, rare_n = _fts_search(query)
+        rare_ids = set(fts_raw[:rare_n])
+        fts_ids = [fid for fid in fts_raw if fid in pool_by_id]
+
+        # Weighted RRF fusion: single-word query -> FTS weighs double
+        w_fts = 2.0 if len(_query_tokens(query)) == 1 else 1.0
+        rrf = {}
+        for rank, fact in enumerate(vec_top):
+            rrf[fact.id] = rrf.get(fact.id, 0.0) + 1.0 / (RRF_K + rank)
+        for rank, fid in enumerate(fts_ids):
+            w = w_fts * (1.5 if fid in rare_ids else 1.0)
+            rrf[fid] = rrf.get(fid, 0.0) + w / (RRF_K + rank)
+        ordered_ids = sorted(rrf, key=lambda i: -rrf[i])
+        ordered = [pool_by_id[i] for i in ordered_ids]
+        explanations.append(
+            f"hybrid: {len(vec_top)} vector + {len(fts_ids)} fts candidates "
+            f"(w_fts={w_fts}) -> rrf {len(ordered)}"
+        )
+
+        # Agent loadout (#44): boost profile domains x2, down-weight others x0.5
+        if profile_domains:
+            for fid in list(rrf):
+                rrf[fid] *= 2.0 if pool_by_id[fid].domain in profile_domains else 0.5
+            explanations.append(f"profile={profile}: {len(profile_domains)} domains boosted")
+
+        # Level weight (#46): deep L2/L3 facts lose RRF to fresh broad L1s.
+        # Multiplicative with the profile boost — both are rank-score weights,
+        # they cannot conflict. Tuned against tests/bench_quality.py.
+        for fid in list(rrf):
+            lvl = pool_by_id[fid].level
+            w = _LEVEL_BOOST.get(getattr(lvl, "value", lvl))
+            if w:
+                rrf[fid] *= w
+        ordered_ids = sorted(rrf, key=lambda i: -rrf[i])
+        ordered = [pool_by_id[i] for i in ordered_ids]
+
+        # Rerank RRF top-10; keep RRF order on any failure.
+        # Docs: head + window around the first query-token occurrence —
+        # a bare [:256] truncation hides deep matches (e.g. 'Vaultwarden'
+        # at char 500 of a WORK-CURRENT digest) and the cross-encoder
+        # then ranks the exact hit LAST (#47 flake).
+        q_tokens = _query_tokens(query)
+
+        def _rerank_doc(content):
+            head = content[:256]
+            low = content.lower()
+            best = None
+            for t in q_tokens:
+                i = low.find(t)
+                if i > 256 and (best is None or i < best):
+                    best = i
+            if best is None:
+                return head
+            start = max(0, best - 64)
+            return head + " ... " + content[start:start + 256]
+
+        if ordered:
+            head, tail = ordered[:RERANK_TOP], ordered[RERANK_TOP:]
+            rr = _call_reranker(query, [_rerank_doc(f.content) for f in head], top_k=RERANK_TOP)
+            if rr:
+                ordered = [head[i] for i, _ in rr] + tail
+                reranked = True
+
+        # Token budget in final order
+        for fact in ordered:
+            tokens = fact.token_estimate()
+            if total_tokens + tokens <= max_tokens:
+                selected_facts.append(fact)
+                total_tokens += tokens
+                if fact.domain and fact.domain not in domains_loaded:
+                    domains_loaded.append(fact.domain)
+
+        selected_sims = [sims[f.id] for f in selected_facts if f.id in sims]
+        if selected_sims:
+            confidence = min(
+                (sum(selected_sims) / len(selected_sims)) * 1.2, 1.0
+            )
+        else:
+            confidence = 0.5
+
+        explanations.append(
+            f"Loaded {len(selected_facts) - len([f for f in selected_facts if f.level == MemoryLevel.L0_PROJECT])} additional facts from {len(domains_loaded)} domains"
+        )
+
+        cross_refs = self._resolve_cross_references(selected_facts)
+        result = RoutingResult(
+            facts=selected_facts,
+            total_tokens=total_tokens,
+            routing_confidence=round(confidence, 3),
+            routing_explanation="; ".join(explanations),
+            cross_references=cross_refs,
+            domains_loaded=domains_loaded,
+            fallback_used=False,
+        )
+        result.reranked = reranked
+        result.profile = profile or "default"
+        result.profile_warning = profile_warning
+        result.as_of = str(as_of) if as_of_dt else None
+        return result
+
+    SemanticRouter.route = _hybrid_route
+    print(f"  [#43] Patched route: FTS5+RRF hybrid (k={RRF_K}, N={TOP_N}), "
+          f"reranker={'on ' + RERANK_URL if RERANK_ENABLED else 'off'}")
+
+    # --- Surface reranked flag in rlm_route_context response ---
+    tool_manager = getattr(server.mcp, "_tool_manager", None)
+    tools_dict = getattr(tool_manager, "_tools", {}) if tool_manager else {}
+    tool_entry = tools_dict.get("rlm_route_context")
+    if tool_entry is not None and hasattr(tool_entry, "fn"):
+        import functools
+
+        @functools.wraps(tool_entry.fn)
+        async def _route_tool_with_meta(query, max_tokens=2000, include_stale=False):
+            try:
+                router = server.memory_bridge_v2_components["router"]
+                result = router.route(
+                    query=query, max_tokens=max_tokens, include_stale=include_stale
+                )
+                formatted = router.format_context_for_injection(result)
+                return {
+                    "status": "success",
+                    "facts_count": len(result.facts),
+                    "total_tokens": result.total_tokens,
+                    "routing_confidence": result.routing_confidence,
+                    "routing_explanation": result.routing_explanation,
+                    "domains_loaded": result.domains_loaded,
+                    "fallback_used": result.fallback_used,
+                    "reranked": getattr(result, "reranked", False),
+                    "context": formatted,
+                }
+            except Exception as e:
+                return {"status": "error", "message": str(e)}
+
+        tool_entry.fn = _route_tool_with_meta
+        print("  [#43] rlm_route_context response gains 'reranked' field")
+    else:
+        print("  [#43] WARNING: cannot wrap rlm_route_context tool fn")
+
+
+def _patch_agent_loadout(server):
+    """Agent loadout: routing profiles per agent role (#44, 2026-08-02).
+
+    Idea from TencentDB Agent Memory ('agent loadout'): a role-scoped view of
+    memory. Profiles live in module-level _AGENT_PROFILES (domains = real
+    values from hierarchical_facts). Effect: profile-domain facts get RRF
+    x2.0, others x0.5 (down-weighted, not excluded). Unknown profile ->
+    default routing + 'warning' field in the response.
+
+    - rlm_route_context / rlm_enterprise_context gain an optional `profile`
+      param (tools are REBUILT so the JSON schema includes it; FastMCP
+      validates args from the schema captured at registration, so a plain
+      fn swap is not enough).
+    - New tool rlm_list_profiles.
+    """
+    from mcp.server.fastmcp.tools import Tool as _FastMCPTool
+
+    from rlm_toolkit.memory_bridge.v2.automode import (
+        EnterpriseContext,
+        EnterpriseContextBuilder,
+    )
+
+    # --- enterprise builder: thread profile into router.route() ---
+    def _build_with_profile(self, query, max_tokens=3000, include_causal=True,
+                            task_hint=None, profile=None):
+        """EnterpriseContextBuilder.build + profile pass-through (#44)."""
+        self.orchestrator.discover_or_restore(task_hint=task_hint)
+        causal_budget = 500 if include_causal else 0
+        routing_result = self.router.route(
+            query=query,
+            max_tokens=max_tokens - causal_budget,
+            profile=profile,
+        )
+        causal_summary = ""
+        if include_causal:
+            causal_summary = self._get_causal_summary(query)
+        project_overview = self._get_project_overview()
+        suggestions = self._build_suggestions()
+        total_tokens = routing_result.total_tokens
+        total_tokens += len(causal_summary) // 4
+        total_tokens += len(project_overview) // 4
+        ctx = EnterpriseContext(
+            facts=routing_result.facts,
+            causal_summary=causal_summary,
+            project_overview=project_overview,
+            total_tokens=total_tokens,
+            discovery_performed=self.orchestrator.last_discovery_performed,
+            suggestions=suggestions,
+        )
+        ctx.profile_warning = getattr(routing_result, "profile_warning", None)
+        return ctx
+
+    EnterpriseContextBuilder.build = _build_with_profile
+    print("  [#44] Patched EnterpriseContextBuilder.build: profile pass-through")
+
+    # --- rebuild MCP tools with `profile` in the schema ---
+    tool_manager = getattr(server.mcp, "_tool_manager", None)
+    tools_dict = getattr(tool_manager, "_tools", None)
+    if tools_dict is None:
+        print("  [#44] WARNING: no tool manager — profiles not exposed")
+        return
+
+    async def _route_fn(query: str, max_tokens: int = 2000,
+                        include_stale: bool = False, profile: str = "",
+                        as_of: str = ""):
+        """Route context based on semantic similarity."""
+        try:
+            router = server.memory_bridge_v2_components["router"]
+            result = router.route(
+                query=query, max_tokens=max_tokens,
+                include_stale=include_stale, profile=profile or None,
+                as_of=as_of or None,
+            )
+            formatted = router.format_context_for_injection(result)
+            resp = {
+                "status": "success",
+                "facts_count": len(result.facts),
+                "total_tokens": result.total_tokens,
+                "routing_confidence": result.routing_confidence,
+                "routing_explanation": result.routing_explanation,
+                "domains_loaded": result.domains_loaded,
+                "fallback_used": result.fallback_used,
+                "reranked": getattr(result, "reranked", False),
+                "profile": getattr(result, "profile", "default"),
+                "context": formatted,
+            }
+            if getattr(result, "as_of", None):
+                resp["as_of"] = result.as_of
+            warn = getattr(result, "profile_warning", None)
+            if warn:
+                resp["warning"] = warn
+            return resp
+        except Exception as e:
+            return {"status": "error", "message": str(e)}
+
+    async def _enterprise_fn(query: str, max_tokens: int = 3000, mode: str = "auto",
+                             include_causal: bool = True, task_hint: str = "",
+                             profile: str = ""):
+        """Enterprise context in one call."""
+        try:
+            comps = server.memory_bridge_v2_components
+            orchestrator = comps["orchestrator"]
+            context_builder = comps["context_builder"]
+            hint = task_hint or None
+            if mode == "discovery":
+                orchestrator.force_discovery(task_hint=hint)
+            elif mode == "auto":
+                orchestrator.discover_or_restore(task_hint=hint)
+            context = context_builder.build(
+                query=query, max_tokens=max_tokens,
+                include_causal=include_causal, task_hint=hint,
+                profile=profile or None,
+            )
+            resp = {
+                "status": "success",
+                "context": context.to_injection_string(),
+                "facts_count": len(context.facts),
+                "tokens_used": context.total_tokens,
+                "discovery_performed": context.discovery_performed,
+                "causal_included": bool(context.causal_summary),
+                "profile": profile or "default",
+                "suggestions": [s.to_dict() for s in context.suggestions],
+            }
+            warn = getattr(context, "profile_warning", None)
+            if warn:
+                resp["warning"] = warn
+            return resp
+        except Exception as e:
+            return {"status": "error", "message": str(e)}
+
+    for name, fn in (("rlm_route_context", _route_fn),
+                     ("rlm_enterprise_context", _enterprise_fn)):
+        old = tools_dict.get(name)
+        if old is None:
+            print(f"  [#44] WARNING: {name} not in registry")
+            continue
+        tools_dict[name] = _FastMCPTool.from_function(
+            fn, name=name,
+            description=(old.description or "") +
+            " Optional 'profile': agent loadout profile (see rlm_list_profiles)."
+            " Optional 'as_of' (ISO date): knowledge state at that moment.",
+        )
+        print(f"  [#44] Rebuilt {name}: +profile param")
+
+    @server.mcp.tool(
+        name="rlm_list_profiles",
+        description=(
+            "List agent routing profiles (loadout). Pass profile=<name> to "
+            "rlm_route_context / rlm_enterprise_context: profile-domain facts "
+            "are boosted x2, others down-weighted x0.5. 'default' = no bias."
+        ),
+    )
+    async def rlm_list_profiles():
+        """List available agent loadout profiles."""
+        return {
+            "status": "success",
+            "profiles": {
+                name: {"description": p["description"], "domains": p["domains"]}
+                for name, p in _AGENT_PROFILES.items()
+            },
+        }
+
+    print(f"  [#44] Registered rlm_list_profiles ({len(_AGENT_PROFILES)} profiles)")
+
+
+def _patch_bitemporal(server):
+    """Bi-temporal validity windows (#45, 2026-08-02).
+
+    Model (from bus-atlas: 'nothing is overwritten; edges and evidence have
+    valid_from/valid_to; answer how knowledge looked at date X'):
+    - valid_from = since when the fact is true; valid_until = when it stopped
+      (NULL = currently valid). Columns existed; docker/migrate_bitemporal.py
+      backfilled valid_until = created_at for pre-existing stale/archived rows
+      (rough: real close time was never recorded — documented in the script).
+    - Closing paths stamp valid_until = now and keep flags in sync:
+      mark_stale / archive_fact (already, #42), delete_fact (now SOFT).
+    - as_of (ISO) in rlm_route_context / rlm_diff: temporal predicate
+      valid_from <= as_of AND (valid_until IS NULL OR valid_until > as_of)
+      replaces the is_stale/is_archived flag filters (#43/#42 code).
+    - New tools: rlm_invalidate_fact (close window + reason),
+      rlm_list_inactive (recently closed, for reviews).
+    """
+    import sqlite3
+    from datetime import datetime
+
+    from rlm_toolkit.memory_bridge.v2.hierarchical import HierarchicalMemoryStore
+
+    store = getattr(server, "memory_bridge_v2_store", None)
+    if store is None:
+        print("  [#45] WARNING: no v2 store — bitemporal tools not registered")
+        return
+
+    # Soft delete: close the window instead of removing the row.
+    # is_archived keeps it out of all current-state readers; the FTS trigger
+    # on is_archived removes the search index row automatically.
+    def _soft_delete_fact(self, fact_id):
+        now = datetime.now().isoformat()
+        with sqlite3.connect(self.db_path) as conn:
+            result = conn.execute(
+                "UPDATE hierarchical_facts "
+                "SET is_archived = 1, is_stale = 1, "
+                "valid_until = COALESCE(valid_until, ?) WHERE id = ?",
+                (now, fact_id),
+            )
+            return result.rowcount > 0
+
+    HierarchicalMemoryStore.delete_fact = _soft_delete_fact
+    print("  [#45] delete_fact -> soft delete (valid_until=now, flags synced)")
+
+    @server.mcp.tool(
+        name="rlm_invalidate_fact",
+        description=(
+            "Close a fact's validity window (bi-temporal invalidate): "
+            "valid_until=now + is_stale=1. The fact is NOT deleted — it stays "
+            "visible to as_of queries about the past. reason is logged only."
+        ),
+    )
+    async def rlm_invalidate_fact(fact_id: str, reason: str = ""):
+        """Invalidate a fact by closing its validity window."""
+        try:
+            ok = store.mark_stale(fact_id)  # #42: is_stale=1 + valid_until=now
+            if not ok:
+                return {"status": "error", "message": f"fact not found: {fact_id}"}
+            if reason:
+                print(f"  [#45] invalidate {fact_id}: {reason}")
+            return {
+                "status": "success",
+                "fact_id": fact_id,
+                "valid_until": datetime.now().isoformat(),
+                "note": "window closed; still visible via as_of queries",
+            }
+        except Exception as e:
+            return {"status": "error", "message": str(e)}
+
+    @server.mcp.tool(
+        name="rlm_list_inactive",
+        description=(
+            "List recently invalidated facts (valid_until set), newest first — "
+            "for memory reviews. Includes valid_until, stale/archived flags."
+        ),
+    )
+    async def rlm_list_inactive(limit: int = 50):
+        """Recently closed facts, newest first."""
+        try:
+            with sqlite3.connect(str(store.db_path)) as conn:
+                conn.row_factory = sqlite3.Row
+                rows = conn.execute(
+                    "SELECT id, level, domain, created_at, valid_until, "
+                    "is_stale, is_archived, substr(content, 1, 160) AS content "
+                    "FROM hierarchical_facts WHERE valid_until IS NOT NULL "
+                    "ORDER BY valid_until DESC LIMIT ?",
+                    (max(1, min(int(limit), 500)),),
+                ).fetchall()
+            return {
+                "status": "success",
+                "count": len(rows),
+                "inactive": [dict(r) for r in rows],
+            }
+        except Exception as e:
+            return {"status": "error", "message": str(e)}
+
+    print("  [#45] Registered rlm_invalidate_fact + rlm_list_inactive")
+
+
+# Revisor defaults (#47) — used when /data/revisor.yaml is absent.
+# domain -> days after which a live fact becomes a freshness candidate.
+_REVISOR_TTL_DAYS = {
+    "work_current": 7,
+    "tasks": 30,
+    "project_status": 30,
+    "infrastructure": 90,
+    "deploy": 30,
+    "deployment": 30,
+}
+# Immortal domains: never auto-invalidated (timeless knowledge)
+_REVISOR_NEVER = {
+    "pitfalls", "decisions", "security", "licensing", "reference",
+    "causal", "revisor",
+}
+_REVISOR_DEFAULT_TTL = 90  # domains not listed in the map
+_REVISOR_MAX_INVALIDATE = 20  # safety cap per run
+
+
+def _patch_revisor(server):
+    """Autonomous freshness revisor (#47, 2026-08-02).
+
+    Background pass over live facts, three escalating levels:
+    1. TTL rules per domain (config /data/revisor.yaml, defaults in code):
+       expired -> candidate. Immortal domains (_REVISOR_NEVER) are skipped.
+    2. Endpoint liveness: host:port / http(s) URLs in the candidate's
+       content are probed (TCP 2s; HTTP HEAD). Any alive endpoint ->
+       candidate is KEPT (evidence recorded). Dead endpoint -> invalidate.
+    3. Optional LLM pass (deep runs only): REVISOR_LLM_URL (OpenAI-compatible
+       /chat/completions) + REVISOR_LLM_MODEL (default qwen3:8b) classify
+       STALE/CURRENT/DEBATABLE. Unset/unreachable -> level silently skipped.
+
+    Modes: REVISOR_MODE=report (default, report only) | auto (invalidate via
+    mark_stale -> valid_until=now, bi-temporal). Cap: 20 invalidations/run.
+    Schedule: daily 04:17 local (levels 1-2), Sunday 04:17 deep (+LLM).
+    Every run writes a report fact (level 1, domain 'revisor').
+    Manual run: rlm_revisor_run(deep=false, mode="").
+    """
+    import asyncio
+    import json
+    import re
+    import socket
+    import sqlite3
+    import threading
+    import urllib.error
+    import urllib.request
+    from datetime import datetime, timedelta
+
+    from rlm_toolkit.memory_bridge.v2.hierarchical import MemoryLevel
+
+    store = getattr(server, "memory_bridge_v2_store", None)
+    if store is None:
+        print("  [#47] WARNING: no v2 store — revisor not registered")
+        return
+    db_path = str(store.db_path)
+
+    CONFIG_PATH = "/data/revisor.yaml"
+    REVISOR_MODE = os.environ.get("REVISOR_MODE", "report").lower()
+    REVISOR_ENABLED = os.environ.get("REVISOR_ENABLED", "true").lower() not in ("0", "false", "no")
+    LLM_URL = os.environ.get("REVISOR_LLM_URL", "").rstrip("/")
+    LLM_MODEL = os.environ.get("REVISOR_LLM_MODEL", "qwen3:8b")
+
+    def _load_config():
+        """-> (ttl_map, never_set, default_ttl). revisor.yaml overrides defaults."""
+        ttl = dict(_REVISOR_TTL_DAYS)
+        never = set(_REVISOR_NEVER)
+        default = _REVISOR_DEFAULT_TTL
+        try:
+            with open(CONFIG_PATH) as f:
+                text = f.read()
+        except OSError:
+            return ttl, never, default
+        try:
+            import yaml
+            data = yaml.safe_load(text) or {}
+            ttl.update({k: int(v) for k, v in (data.get("ttl_days") or {}).items()})
+            never.update(data.get("never") or [])
+            default = int(data.get("default_ttl_days", default))
+            return ttl, never, default
+        except ImportError:
+            pass
+        # Fallback: minimal parser for 'key: value', 'ttl_days:' section,
+        # 'never: [a, b]' or 'never: a, b'
+        section = None
+        for raw in text.splitlines():
+            line = raw.split("#")[0].rstrip()
+            if not line.strip():
+                continue
+            stripped = line.strip()
+            if stripped == "ttl_days:":
+                section = "ttl"
+                continue
+            if section == "ttl" and raw.startswith((" ", "\t")) and ":" in stripped:
+                k, _, v = stripped.partition(":")
+                try:
+                    ttl[k.strip()] = int(v.strip())
+                except ValueError:
+                    pass
+                continue
+            section = None
+            key, _, val = stripped.partition(":")
+            key, val = key.strip(), val.strip().strip("[]")
+            if key == "default_ttl_days":
+                try:
+                    default = int(val)
+                except ValueError:
+                    pass
+            elif key == "never":
+                never.update(x.strip() for x in val.split(",") if x.strip())
+        return ttl, never, default
+
+    _URL_RE = re.compile(r"https?://[^\s\"'<>\)\]]+")
+    _HOSTPORT_RE = re.compile(r"\b((?:\d{1,3}\.){3}\d{1,3}):(\d{2,5})\b")
+
+    def _check_endpoints(content):
+        """-> (alive: True/False/None, evidence list). Any alive -> True."""
+        urls = _URL_RE.findall(content or "")[:3]
+        hps = _HOSTPORT_RE.findall(content or "")[:3]
+        evidence = []
+        alive_any = dead_any = False
+        for u in urls:
+            try:
+                req = urllib.request.Request(u, method="HEAD")
+                urllib.request.urlopen(req, timeout=2)
+                alive_any = True
+                evidence.append(f"alive: {u}")
+            except urllib.error.HTTPError as e:
+                alive_any = True  # host responded — endpoint is alive
+                evidence.append(f"alive(http {e.code}): {u}")
+            except Exception:
+                dead_any = True
+                evidence.append(f"dead: {u}")
+        for h, p in hps:
+            try:
+                s = socket.create_connection((h, int(p)), timeout=2)
+                s.close()
+                alive_any = True
+                evidence.append(f"alive: {h}:{p}")
+            except Exception:
+                dead_any = True
+                evidence.append(f"dead: {h}:{p}")
+        if alive_any:
+            return True, evidence
+        if dead_any:
+            return False, evidence
+        return None, evidence
+
+    def _llm_verdict(content):
+        """-> (verdict: stale/current/debatable/None, one-line reason)."""
+        if not LLM_URL:
+            return None, ""
+        prompt = (
+            "You audit a knowledge-base fact for freshness. Today is "
+            + datetime.now().date().isoformat()
+            + ". Reply with exactly one word — STALE, CURRENT, or DEBATABLE — "
+            "then a dash and a one-line reason.\n\nFACT:\n" + content[:1500]
+        )
+        payload = json.dumps({
+            "model": LLM_MODEL,
+            "messages": [{"role": "user", "content": prompt}],
+            "temperature": 0,
+            "max_tokens": 200,
+            "stream": False,
+        }).encode()
+        req = urllib.request.Request(
+            f"{LLM_URL}/chat/completions", data=payload,
+            headers={"Content-Type": "application/json"}, method="POST",
+        )
+        try:
+            with urllib.request.urlopen(req, timeout=30) as resp:
+                data = json.loads(resp.read())
+            text = data["choices"][0]["message"]["content"]
+        except Exception as e:
+            return None, f"llm unavailable: {type(e).__name__}"
+        text = re.sub(r"<think>.*?</think>", "", text, flags=re.S).strip()
+        low = text.lower()
+        if low.startswith("stale"):
+            return "stale", text[:120]
+        if low.startswith("current"):
+            return "current", text[:120]
+        return "debatable", text[:120]
+
+    def _revisor_run(deep=False, mode=""):
+        mode = (mode or REVISOR_MODE).lower()
+        ttl_map, never, default_ttl = _load_config()
+        now = datetime.now()
+        with sqlite3.connect(db_path) as conn:
+            conn.row_factory = sqlite3.Row
+            rows = conn.execute(
+                "SELECT id, content, domain, level, created_at "
+                "FROM hierarchical_facts "
+                "WHERE is_stale = 0 AND is_archived = 0 AND valid_until IS NULL"
+            ).fetchall()
+
+        candidates = []
+        for r in rows:
+            d = (r["domain"] or "").strip()
+            if d in never:
+                continue
+            ttl = ttl_map.get(d, default_ttl)
+            try:
+                created = datetime.fromisoformat(r["created_at"])
+            except (TypeError, ValueError):
+                continue
+            if (now - created).days >= ttl:
+                candidates.append((r, ttl))
+
+        decisions = []      # {"id", "reason", "action"}
+        ping_alive_n = 0
+        evidence_log = []
+        applied = 0
+
+        # Endpoint probes are I/O-bound and serially slow (hundreds of
+        # candidates x up to 2s timeout) — run them concurrently.
+        from concurrent.futures import ThreadPoolExecutor
+        with ThreadPoolExecutor(max_workers=16) as pool:
+            ping_results = list(
+                pool.map(lambda c: _check_endpoints(c[0]["content"]), candidates)
+            )
+
+        for (r, ttl), (alive, ev) in zip(candidates, ping_results):
+            evidence_log.extend(ev)
+            if alive is True:
+                ping_alive_n += 1
+                continue
+            if alive is False:
+                reason = "endpoint dead: " + (ev[-1] if ev else "unreachable")
+            elif deep:
+                verdict, why = _llm_verdict(r["content"])
+                if verdict == "stale":
+                    reason = f"llm stale: {why}"
+                else:
+                    continue  # current/debatable/unavailable -> keep
+            else:
+                reason = f"ttl {ttl}d exceeded (domain={r['domain'] or '-'})"
+
+            action = "would_invalidate"
+            if mode == "auto":
+                if applied < _REVISOR_MAX_INVALIDATE:
+                    store.mark_stale(r["id"])  # #42: is_stale=1, valid_until=now
+                    applied += 1
+                    action = "invalidated"
+                else:
+                    action = "over_limit"
+            decisions.append({
+                "id": r["id"], "reason": reason, "action": action,
+                "domain": r["domain"], "created_at": r["created_at"],
+            })
+
+        report = {
+            "status": "success",
+            "date": now.isoformat(timespec="seconds"),
+            "mode": mode,
+            "deep": bool(deep),
+            "live_facts": len(rows),
+            "candidates": len(candidates),
+            "invalidated": applied,
+            "ping_alive_skipped": ping_alive_n,
+            "decisions": decisions[:_REVISOR_MAX_INVALIDATE],
+            "evidence": evidence_log[:20],
+        }
+
+        # Report fact into RLM itself (level 1, domain 'revisor')
+        lines = [
+            f"REVISOR RUN {report['date']} | mode={mode} deep={bool(deep)} | "
+            f"live={len(rows)} candidates={len(candidates)} "
+            f"invalidated={applied} ping-alive={ping_alive_n}",
+        ]
+        for d in decisions[:_REVISOR_MAX_INVALIDATE]:
+            lines.append(f"- [{d['action']}] {d['id'][:8]} ({d['domain']}) {d['reason'][:100]}")
+        try:
+            store.add_fact(
+                content="\n".join(lines),
+                level=MemoryLevel.L1_DOMAIN,
+                domain="revisor",
+                source="revisor",
+            )
+        except Exception as e:
+            print(f"  [#47] failed to store report fact: {e}")
+        return report
+
+    @server.mcp.tool(
+        name="rlm_revisor_run",
+        description=(
+            "Run the freshness revisor now. Levels: TTL rules per domain "
+            "(/data/revisor.yaml), endpoint ping, optional LLM (deep=true). "
+            "mode: '' = REVISOR_MODE env (default report), 'report' = dry run, "
+            "'auto' = invalidate (close validity window, cap 20). "
+            "Writes a report fact (domain 'revisor')."
+        ),
+    )
+    async def rlm_revisor_run(deep: bool = False, mode: str = ""):
+        """Run one revisor pass and return the report."""
+        try:
+            return await asyncio.to_thread(_revisor_run, deep, mode)
+        except Exception as e:
+            return {"status": "error", "message": str(e)}
+
+    print("  [#47] Registered rlm_revisor_run")
+
+    # --- schedule: daily 04:17 local (quick), Sunday 04:17 (deep, +LLM) ---
+    async def _revisor_loop():
+        while True:
+            now = datetime.now()
+            nxt = now.replace(hour=4, minute=17, second=0, microsecond=0)
+            if nxt <= now:
+                nxt += timedelta(days=1)
+            await asyncio.sleep((nxt - now).total_seconds())
+            try:
+                deep = datetime.now().weekday() == 6  # Sunday
+                rep = await asyncio.to_thread(_revisor_run, deep, "")
+                print(f"  [#47] scheduled run: mode={rep['mode']} deep={rep['deep']} "
+                      f"candidates={rep['candidates']} invalidated={rep['invalidated']}")
+            except Exception as e:
+                print(f"  [#47] scheduled run failed: {type(e).__name__}: {e}")
+
+    if REVISOR_ENABLED:
+        threading.Thread(
+            target=lambda: asyncio.run(_revisor_loop()),
+            daemon=True, name="revisor-scheduler",
+        ).start()
+        print(f"  [#47] scheduler on (mode={REVISOR_MODE}, daily 04:17, "
+              f"llm={'on ' + LLM_URL if LLM_URL else 'off'})")
+    else:
+        print("  [#47] scheduler off (REVISOR_ENABLED=false), manual runs only")
+
+
 def main():
     parser = argparse.ArgumentParser(description="RLM-Toolkit MCP server launcher")
     parser.add_argument("--host", default="0.0.0.0")
@@ -1309,12 +2764,21 @@ def main():
     _patch_format_context()           # #33
     _patch_fact_id_consistency(server)          # #40
     _patch_enterprise_context_description(server)  # #41
+    _patch_freshness_and_diff(server)           # #42
+    _patch_hybrid_search(server)                # #43
+    _patch_agent_loadout(server)                # #44
+    _patch_bitemporal(server)                   # #45
+    _patch_revisor(server)                      # #47
 
     server.mcp.settings.host = args.host
     server.mcp.settings.port = args.port
 
     # Disable host validation — container is network-exposed, not localhost-only
     server.mcp.settings.transport_security = None
+
+    # Fix: Claude Code sends Accept: application/json without text/event-stream
+    # json_response=True makes server return JSON and skip SSE Accept check
+    server.mcp.settings.json_response = True
 
     server.mcp.run(transport=args.transport)
 
