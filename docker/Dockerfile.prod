@@ -1,0 +1,45 @@
+# Reproducible RLM server image (2026-08-02).
+# Mirrors the live prod deployment: rlm-toolkit 2.3.1 + start_server.py
+# with monkey-patches #5..#46 (rlm_diff, freshness, card embeddings,
+# FTS5+RRF, reranker, loadout profiles, bi-temporal).
+#
+# Build context = REPO ROOT:
+#   docker build -f docker/Dockerfile.prod -t rlm-server:20260802 .
+# Run:
+#   docker run -d --name rlm -p 8250:8250 -v rlm-data:/data rlm-server:20260802
+# The volume must contain .rlm/memory/memory_bridge_v2.db (migrated —
+# see migrate_card_embeddings.py / migrate_bitemporal.py; both run
+# automatically? NO — they are one-off scripts, already applied to the
+# production DB. Copy the migrated DB into the volume before first run).
+
+FROM python:3.11-slim
+
+# CPU-only torch first (avoids multi-GB CUDA wheels), then toolkit.
+# Versions pinned to the live prod venv (pip list 2026-08-02).
+RUN pip install --no-cache-dir \
+        torch --index-url https://download.pytorch.org/whl/cpu && \
+    pip install --no-cache-dir \
+        "rlm-toolkit[all]==2.3.1" \
+        "mcp==1.27.0" \
+        "sentence-transformers==5.4.0" \
+        watchdog
+
+# Pre-bake the embedding model — runtime must not depend on HF reachability.
+# MUST match RLM_EMBEDDING_MODEL and embeddings_index.model_name in the DB.
+RUN python -c "from sentence_transformers import SentenceTransformer; SentenceTransformer('all-MiniLM-L6-v2')"
+
+WORKDIR /app
+COPY docker/start_server.py /app/start_server.py
+COPY docker/migrate_card_embeddings.py /app/migrate_card_embeddings.py
+COPY docker/migrate_bitemporal.py /app/migrate_bitemporal.py
+
+ENV RLM_DATA_DIR=/data/.rlm \
+    RLM_PROJECT_ROOT=/data \
+    RLM_EMBEDDING_MODEL=all-MiniLM-L6-v2 \
+    RERANK_ENABLED=true \
+    RERANK_URL=http://127.0.0.1:8400
+
+VOLUME ["/data"]
+EXPOSE 8250
+
+CMD ["python", "/app/start_server.py", "--transport", "streamable-http", "--host", "0.0.0.0", "--port", "8250"]

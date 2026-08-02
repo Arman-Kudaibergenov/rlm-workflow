@@ -28,3 +28,7 @@ Thumbs.db
 .idea/
 .worktrees/
 .rlm/
+
+# Local prod bench with real topics (not for public repo)
+tests/bench_quality.prod.json
+docker/*.bak-*
