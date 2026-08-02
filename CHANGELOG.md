@@ -2,6 +2,33 @@
 
 This file documents all modifications made to the original [RLM-Toolkit](https://github.com/DmitrL-dev/AISecurity/tree/main/rlm-toolkit) by Dmitry Labintcev.
 
+## v2.0.0 (2026-08-02)
+
+Major release: hybrid search, bi-temporal memory, agent loadout, autonomous freshness, reproducible Docker image. Quality gate: hit@5 = 27/27 (1.00) on the regression bench.
+
+### Added
+- **`rlm_diff(since)`** — memory delta tool: new/updated/staled facts since a timestamp or relative window (`24h`, `7d`), grouped, paginated.
+- **Freshness in routing** — every fact in `rlm_route_context` / `rlm_enterprise_context` now carries its date and `[STALE]` marker.
+- **Card embeddings** — facts are embedded as structured cards (`domain | level | title | content`) instead of raw text (proven discovery improvement).
+- **FTS5 + RRF hybrid search** — BM25 (with rare-token tier) fused with vector search via RRF; single-word queries favor exact match, ranked output is now strictly by relevance (no more level-grouped formatting).
+- **Reranker integration** — optional cross-encoder rerank (`RERANK_URL`) with circuit breaker (3s timeout, 120s cooldown) and query-window document trimming.
+- **Agent loadout profiles** — `profile` parameter (`dev-1c`, `em`, `infra`) in routing: domain-scoped boost/penalty; `rlm_list_profiles` tool.
+- **Bi-temporal validity** — facts have `valid_from`/`valid_until`; invalidation closes the window instead of deleting; `as_of` queries ("how memory looked on date X") in route_context and diff; soft delete.
+- **`rlm_invalidate_fact` / `rlm_list_inactive`** — explicit invalidation with timestamp and review list.
+- **Revisor (autonomous freshness)** — built-in daily pass: per-domain TTL rules (`/data/revisor.yaml`), service liveness pings, optional LLM review (`REVISOR_LLM_URL`); `REVISOR_MODE=report|auto`, invalidation cap, report facts; `rlm_revisor_run` manual trigger.
+- **Reproducible Docker image** — `Dockerfile.prod` (embedding model baked in), published as `ghcr.io/arman-kudaibergenov/rlm-workflow:latest`.
+- **Quality bench** — regression harness with hit@5 metric (prod suite 27 questions, neutral template in repo).
+
+### Fixed
+- **Ranking**: L2/L3 facts no longer buried by level-grouped formatting; level weights (L2 ×1.15, L3 ×1.25) applied in RRF.
+- **FTS**: rare-token tier (df≤10) prevents generic-term noise from drowning exact matches.
+- **Reranker**: query-term windowing fixes misses on long facts (>256 chars).
+- **Archive filtering**: archived facts excluded from all read paths.
+
+### Changed
+- Write paths (`mark_stale`, `archive_fact`, `delete`) now stamp `valid_until` (bi-temporal) while keeping legacy flags for compatibility.
+- Total MCP tools: 18.
+
 ## v1.4.0 (2026-04-03)
 
 ### Bug Fixes
