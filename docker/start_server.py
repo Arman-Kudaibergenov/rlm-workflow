@@ -30,6 +30,7 @@ Applies monkey-patches for:
 
 import argparse
 import logging
+import re
 import os
 
 
@@ -933,6 +934,12 @@ def _patch_ttl_days_zero(server):
             parent_id=None,
             ttl_days=None,
         ):
+            # WRITE-RULES gate #48 (2026-08-09): входной фильтр по WRITE-RULES
+            if not domain:
+                return {"status": "rejected", "reason": "domain обязателен (WRITE-RULES)"}
+            _bad = re.match(r"(?i)^(SESSION-END|PRE-COMPACT|POST-COMPACT|HANDOFF|CONTEXT-PREP|SUBAGENT-RESULT|HEARTBEAT)", content.strip())
+            if _bad:
+                return {"status": "rejected", "reason": "протоколы сессий запрещены (WRITE-RULES): " + _bad.group(1)}
             ttl_config = None
             if ttl_days is not None:
                 ttl_config = TTLConfig(
@@ -982,6 +989,12 @@ def _patch_ttl_days_zero(server):
                     parent_id=None,
                     ttl_days=None,
                 ):
+                    # WRITE-RULES gate #48 (2026-08-09): входной фильтр по WRITE-RULES
+                    if not domain:
+                        return {"status": "rejected", "reason": "domain обязателен (WRITE-RULES)"}
+                    _bad = re.match(r"(?i)^(SESSION-END|PRE-COMPACT|POST-COMPACT|HANDOFF|CONTEXT-PREP|SUBAGENT-RESULT|HEARTBEAT)", content.strip())
+                    if _bad:
+                        return {"status": "rejected", "reason": "протоколы сессий запрещены (WRITE-RULES): " + _bad.group(1)}
                     ttl_config = None
                     if ttl_days is not None:
                         ttl_config = TTLConfig(
