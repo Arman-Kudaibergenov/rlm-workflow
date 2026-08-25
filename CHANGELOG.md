@@ -2,6 +2,11 @@
 
 This file documents all modifications made to the original [RLM-Toolkit](https://github.com/DmitrL-dev/AISecurity/tree/main/rlm-toolkit) by Dmitry Labintcev.
 
+## v2.0.1 (2026-08-25)
+
+### Fixed
+- **Docker image crash-loop (#45)** — `docker/Dockerfile` relied on the `rlm-toolkit[all]` extra to pull the MCP SDK, but its `mcp>=1.0` constraint now resolves to mcp 2.x, which has no `mcp.server.fastmcp`; the toolkit's import guard then set `server.mcp = None` and `start_server.py` crashed at `@server.mcp.tool(...)`. The Dockerfile now pins `mcp==1.27.0` and `sentence-transformers==5.4.0` (mirroring `Dockerfile.prod`), and every patch that registers MCP tools (`#42`/`#44`/`#45`/`#47`) skips registration with a loud warning, followed by a clear FATAL at startup, if `server.mcp` is ever `None` again.
+
 ## v2.0.0 (2026-08-02)
 
 Major release: hybrid search, bi-temporal memory, agent loadout, autonomous freshness, reproducible Docker image. Quality gate: hit@5 = 27/27 (1.00) on the regression bench.

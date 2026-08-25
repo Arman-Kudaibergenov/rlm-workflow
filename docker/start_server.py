@@ -1490,6 +1490,9 @@ def _patch_freshness_and_diff(server):
     if store is None:
         print("  [#42] WARNING: no v2 store — rlm_diff not registered")
         return
+    if getattr(server, "mcp", None) is None:
+        print("  [#42] WARNING: MCP SDK missing (server.mcp is None) — rlm_diff not registered")
+        return
     db_path = str(store.db_path)
 
     def _parse_since(since):
@@ -2155,6 +2158,10 @@ def _patch_agent_loadout(server):
       fn swap is not enough).
     - New tool rlm_list_profiles.
     """
+    if getattr(server, "mcp", None) is None:
+        print("  [#44] WARNING: MCP SDK missing (server.mcp is None) — loadout profiles not exposed")
+        return
+
     from mcp.server.fastmcp.tools import Tool as _FastMCPTool
 
     from rlm_toolkit.memory_bridge.v2.automode import (
@@ -2349,6 +2356,10 @@ def _patch_bitemporal(server):
     HierarchicalMemoryStore.delete_fact = _soft_delete_fact
     print("  [#45] delete_fact -> soft delete (valid_until=now, flags synced)")
 
+    if getattr(server, "mcp", None) is None:
+        print("  [#45] WARNING: MCP SDK missing (server.mcp is None) — bitemporal tools not registered")
+        return
+
     @server.mcp.tool(
         name="rlm_invalidate_fact",
         description=(
@@ -2457,6 +2468,9 @@ def _patch_revisor(server):
     store = getattr(server, "memory_bridge_v2_store", None)
     if store is None:
         print("  [#47] WARNING: no v2 store — revisor not registered")
+        return
+    if getattr(server, "mcp", None) is None:
+        print("  [#47] WARNING: MCP SDK missing (server.mcp is None) — revisor not registered")
         return
     db_path = str(store.db_path)
 
@@ -2782,6 +2796,11 @@ def main():
     _patch_agent_loadout(server)                # #44
     _patch_bitemporal(server)                   # #45
     _patch_revisor(server)                      # #47
+
+    if getattr(server, "mcp", None) is None:
+        print("FATAL: MCP SDK not installed or incompatible (server.mcp is None). "
+              "Pin mcp==1.27.0 in the image (issue #45). Cannot start server.")
+        raise SystemExit(1)
 
     server.mcp.settings.host = args.host
     server.mcp.settings.port = args.port
