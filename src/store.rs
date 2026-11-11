@@ -97,6 +97,15 @@ pub struct Store {
     conn: Mutex<Connection>,
     pub embedder: RwLock<Option<Arc<Embedder>>>,
     pub model_name: RwLock<String>,
+    cache: RwLock<Option<Arc<StoreCache>>>,
+}
+
+/// In-memory snapshot of the hot read paths (children map + facts with embeddings).
+/// Rebuilt lazily and cleared on every mutation, so searches skip re-parsing ~7k
+/// JSON embedding vectors from SQLite on each call.
+struct StoreCache {
+    children: HashMap<String, Vec<String>>,
+    facts_emb: Arc<Vec<(Fact, Vec<f32>)>>,
 }
 
 fn open_conn(path: &str) -> Result<Connection> {
@@ -109,6 +118,10 @@ fn open_conn(path: &str) -> Result<Connection> {
         Connection::open(path)?
     };
     conn.busy_timeout(std::time::Duration::from_secs(10))?;
+    if path != ":memory:" {
+        // WAL: concurrent readers don't block the writer; NORMAL is safe with WAL.
+        conn.execute_batch("PRAGMA journal_mode=WAL; PRAGMA synchronous=NORMAL;")?;
+    }
     Ok(conn)
 }
 
@@ -130,12 +143,47 @@ impl Store {
             conn: Mutex::new(conn),
             embedder: RwLock::new(None),
             model_name: RwLock::new("all-MiniLM-L6-v2".to_string()),
+            cache: RwLock::new(None),
         })
     }
 
     pub fn set_embedder(&self, e: Arc<Embedder>) {
         *self.model_name.write().unwrap() = e.model_name().to_string();
         *self.embedder.write().unwrap() = Some(e);
+    }
+
+    fn invalidate_cache(&self) {
+        *self.cache.write().unwrap() = None;
+    }
+
+    /// Return the cached children map + facts-with-embeddings, rebuilding if stale.
+    /// Locks `conn` only while building, never while the caller holds it.
+    fn get_cache(&self) -> Result<Arc<StoreCache>> {
+        if let Some(c) = self.cache.read().unwrap().as_ref() {
+            return Ok(c.clone());
+        }
+        let built = {
+            let conn = self.conn.lock().unwrap();
+            let children = Self::load_children(&conn)?;
+            let mut stmt = conn.prepare(
+                "SELECT hf.*, ei.embedding as stored_embedding
+                 FROM hierarchical_facts hf
+                 JOIN embeddings_index ei ON hf.id = ei.fact_id
+                 WHERE hf.is_archived = 0",
+            )?;
+            let mut facts_emb = Vec::new();
+            let mut rows = stmt.query([])?;
+            while let Some(row) = rows.next()? {
+                let fact = Self::row_to_fact(row, &children)?;
+                let emb = text_of(row, "stored_embedding")
+                    .and_then(|s| serde_json::from_str::<Vec<f32>>(&s).ok())
+                    .unwrap_or_default();
+                facts_emb.push((fact, emb));
+            }
+            Arc::new(StoreCache { children, facts_emb: Arc::new(facts_emb) })
+        };
+        *self.cache.write().unwrap() = Some(built.clone());
+        Ok(built)
     }
 
     fn row_to_fact(row: &rusqlite::Row, children: &HashMap<String, Vec<String>>) -> rusqlite::Result<Fact> {
@@ -274,17 +322,19 @@ impl Store {
                 rusqlite::params![fact_id, ej, model_name, now],
             )?;
         }
+        drop(conn);
+        self.invalidate_cache();
         Ok(fact_id)
     }
 
     #[allow(dead_code)]
     pub fn get_fact(&self, fact_id: &str) -> Result<Option<Fact>> {
+        let cache = self.get_cache()?;
         let conn = self.conn.lock().unwrap();
-        let children = Self::load_children(&conn)?;
         let mut stmt = conn.prepare("SELECT * FROM hierarchical_facts WHERE id = ?1")?;
         let mut rows = stmt.query(rusqlite::params![fact_id])?;
         match rows.next()? {
-            Some(row) => Ok(Some(Self::row_to_fact(row, &children)?)),
+            Some(row) => Ok(Some(Self::row_to_fact(row, &cache.children)?)),
             None => Ok(None),
         }
     }
@@ -296,8 +346,8 @@ impl Store {
         include_stale: bool,
         include_archived: bool,
     ) -> Result<Vec<Fact>> {
+        let cache = self.get_cache()?;
         let conn = self.conn.lock().unwrap();
-        let children = Self::load_children(&conn)?;
         let mut sql = String::from("SELECT * FROM hierarchical_facts WHERE level = ?1");
         if domain.is_some() {
             sql.push_str(" AND domain = ?2");
@@ -311,18 +361,18 @@ impl Store {
         sql.push_str(" ORDER BY created_at DESC");
         let mut stmt = conn.prepare(&sql)?;
         let rows = if let Some(d) = domain {
-            stmt.query_map(rusqlite::params![level, d], |r| Self::row_to_fact(r, &children))?
+            stmt.query_map(rusqlite::params![level, d], |r| Self::row_to_fact(r, &cache.children))?
                 .collect::<std::result::Result<Vec<_>, _>>()?
         } else {
-            stmt.query_map(rusqlite::params![level], |r| Self::row_to_fact(r, &children))?
+            stmt.query_map(rusqlite::params![level], |r| Self::row_to_fact(r, &cache.children))?
                 .collect::<std::result::Result<Vec<_>, _>>()?
         };
         Ok(rows)
     }
 
     pub fn get_all_facts(&self, include_stale: bool, include_archived: bool) -> Result<Vec<Fact>> {
+        let cache = self.get_cache()?;
         let conn = self.conn.lock().unwrap();
-        let children = Self::load_children(&conn)?;
         let mut sql = String::from("SELECT * FROM hierarchical_facts WHERE 1=1");
         if !include_stale {
             sql.push_str(" AND is_stale = 0");
@@ -333,51 +383,35 @@ impl Store {
         sql.push_str(" ORDER BY level ASC, created_at DESC");
         let mut stmt = conn.prepare(&sql)?;
         let rows = stmt
-            .query_map([], |r| Self::row_to_fact(r, &children))?
+            .query_map([], |r| Self::row_to_fact(r, &cache.children))?
             .collect::<std::result::Result<Vec<_>, _>>()?;
         Ok(rows)
     }
 
     pub fn get_domain_facts(&self, domain: &str) -> Result<Vec<Fact>> {
+        let cache = self.get_cache()?;
         let conn = self.conn.lock().unwrap();
-        let children = Self::load_children(&conn)?;
         let mut stmt = conn.prepare(
             "SELECT * FROM hierarchical_facts
              WHERE domain = ?1 AND is_stale = 0 AND is_archived = 0
              ORDER BY level ASC, created_at DESC",
         )?;
         let rows = stmt
-            .query_map(rusqlite::params![domain], |r| Self::row_to_fact(r, &children))?
+            .query_map(rusqlite::params![domain], |r| Self::row_to_fact(r, &cache.children))?
             .collect::<std::result::Result<Vec<_>, _>>()?;
         Ok(rows)
     }
 
     /// JOIN embeddings_index, is_archived = 0 (includes stale — callers filter).
-    pub fn get_facts_with_embeddings(&self) -> Result<Vec<(Fact, Vec<f32>)>> {
-        let conn = self.conn.lock().unwrap();
-        let children = Self::load_children(&conn)?;
-        let mut stmt = conn.prepare(
-            "SELECT hf.*, ei.embedding as stored_embedding
-             FROM hierarchical_facts hf
-             JOIN embeddings_index ei ON hf.id = ei.fact_id
-             WHERE hf.is_archived = 0",
-        )?;
-        let mut out = Vec::new();
-        let mut rows = stmt.query([])?;
-        while let Some(row) = rows.next()? {
-            let fact = Self::row_to_fact(row, &children)?;
-            let emb = text_of(row, "stored_embedding")
-                .and_then(|s| serde_json::from_str::<Vec<f32>>(&s).ok())
-                .unwrap_or_default();
-            out.push((fact, emb));
-        }
-        Ok(out)
+    /// Served from the in-memory cache (rebuilt on mutation).
+    pub fn get_facts_with_embeddings(&self) -> Result<Arc<Vec<(Fact, Vec<f32>)>>> {
+        Ok(self.get_cache()?.facts_emb.clone())
     }
 
     /// Bi-temporal candidate pool (#45): valid_from <= as_of AND window open at as_of.
     pub fn get_facts_with_embeddings_as_of(&self, as_of_iso: &str) -> Result<Vec<(Fact, Vec<f32>)>> {
+        let cache = self.get_cache()?;
         let conn = self.conn.lock().unwrap();
-        let children = Self::load_children(&conn)?;
         let mut stmt = conn.prepare(
             "SELECT hf.*, ei.embedding AS stored_embedding
              FROM hierarchical_facts hf
@@ -388,7 +422,7 @@ impl Store {
         let mut out = Vec::new();
         let mut rows = stmt.query(rusqlite::params![as_of_iso])?;
         while let Some(row) = rows.next()? {
-            let fact = Self::row_to_fact(row, &children)?;
+            let fact = Self::row_to_fact(row, &cache.children)?;
             let emb = text_of(row, "stored_embedding")
                 .and_then(|s| serde_json::from_str::<Vec<f32>>(&s).ok())
                 .unwrap_or_default();
@@ -407,6 +441,8 @@ impl Store {
              VALUES (?1, ?2, ?3, ?4)",
             rusqlite::params![fact_id, ej, model_name, now],
         )?;
+        drop(conn);
+        self.invalidate_cache();
         Ok(())
     }
 
@@ -418,6 +454,8 @@ impl Store {
             "UPDATE hierarchical_facts SET is_stale = 1, valid_until = COALESCE(valid_until, ?1) WHERE id = ?2",
             rusqlite::params![now, fact_id],
         )?;
+        drop(conn);
+        self.invalidate_cache();
         Ok(n > 0)
     }
 
@@ -428,6 +466,8 @@ impl Store {
             "UPDATE hierarchical_facts SET is_archived = 1, valid_until = COALESCE(valid_until, ?1) WHERE id = ?2",
             rusqlite::params![now, fact_id],
         )?;
+        drop(conn);
+        self.invalidate_cache();
         Ok(n > 0)
     }
 
@@ -440,6 +480,8 @@ impl Store {
              SET is_archived = 1, is_stale = 1, valid_until = COALESCE(valid_until, ?1) WHERE id = ?2",
             rusqlite::params![now, fact_id],
         )?;
+        drop(conn);
+        self.invalidate_cache();
         Ok(n > 0)
     }
 
@@ -448,6 +490,8 @@ impl Store {
         let now = now_iso();
         let conn = self.conn.lock().unwrap();
         conn.execute("UPDATE hierarchical_facts SET valid_from = ?1 WHERE id = ?2", rusqlite::params![now, fact_id])?;
+        drop(conn);
+        self.invalidate_cache();
         Ok(())
     }
 

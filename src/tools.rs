@@ -29,6 +29,7 @@ pub struct AppState {
     pub orchestrator: Arc<Orchestrator>,
     pub builder: Arc<ContextBuilder>,
     pub revisor: Arc<Revisor>,
+    pub metrics: Arc<crate::metrics::Metrics>,
 }
 
 pub struct ToolDef {

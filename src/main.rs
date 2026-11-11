@@ -8,6 +8,7 @@ mod coldstart;
 mod consolidate;
 mod embed;
 mod mcp;
+mod metrics;
 mod profiles;
 mod revisor;
 mod rerank;
@@ -19,6 +20,9 @@ mod store;
 mod tools;
 mod ttl;
 mod util;
+
+#[cfg(test)]
+mod tests;
 
 use std::sync::Arc;
 
@@ -205,6 +209,7 @@ async fn main() -> Result<()> {
         orchestrator,
         builder,
         revisor: revisor.clone(),
+        metrics: Arc::new(metrics::Metrics::new()),
     });
 
     // Revisor scheduler (#47): daily 04:17, Sunday deep
@@ -243,6 +248,8 @@ async fn main() -> Result<()> {
                 .get(mcp::handle_get)
                 .delete(mcp::handle_delete),
         )
+        .route("/health", axum::routing::get(mcp::handle_health))
+        .route("/metrics", axum::routing::get(mcp::handle_metrics))
         .with_state(mcp_state);
 
     let addr = format!("{host}:{port}");

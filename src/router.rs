@@ -160,10 +160,14 @@ impl Router {
         }
 
         // Candidate pool
-        let candidates = if let Some(iso) = &as_of_iso {
-            self.store.get_facts_with_embeddings_as_of(iso)?
+        let as_of_vec = if let Some(iso) = &as_of_iso {
+            Some(self.store.get_facts_with_embeddings_as_of(iso)?)
         } else {
-            facts_with_embeddings
+            None
+        };
+        let candidates: &[(Fact, Vec<f32>)] = match &as_of_vec {
+            Some(v) => v.as_slice(),
+            None => facts_with_embeddings.as_slice(),
         };
         let mut pool: Vec<(Fact, Vec<f32>)> = Vec::new();
         for (fact, emb) in candidates {
@@ -185,7 +189,7 @@ impl Router {
                     }
                 }
             }
-            pool.push((fact, emb));
+            pool.push((fact.clone(), emb.clone()));
         }
         let pool_by_id: HashMap<String, Fact> = pool.iter().map(|(f, _)| (f.id.clone(), f.clone())).collect();
 

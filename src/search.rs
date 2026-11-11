@@ -49,7 +49,7 @@ pub fn hybrid_search(
 
     let mut scored: Vec<(crate::store::Fact, f64)> = Vec::new();
 
-    for (fact, emb) in &facts_with_emb {
+    for (fact, emb) in facts_with_emb.iter() {
         if fact.is_stale || is_noise_content(&fact.content) {
             continue;
         }

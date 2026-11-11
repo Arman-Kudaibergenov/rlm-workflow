@@ -63,6 +63,7 @@ pub async fn handle_post(State(state): State<Arc<McpState>>, headers: HeaderMap,
         if hdr_sid.is_empty() { "-" } else { &hdr_sid[..8.min(hdr_sid.len())] },
         body.len()
     );
+    state.app.metrics.record_request();
 
     if req.is_array() {
         return (
@@ -135,8 +136,10 @@ pub async fn handle_post(State(state): State<Arc<McpState>>, headers: HeaderMap,
             let args = params.get("arguments").cloned().unwrap_or(json!({}));
             let app = state.app.clone();
             let name_for_schema = name.clone();
+            let t0 = std::time::Instant::now();
             let call = tokio::task::spawn_blocking(move || tools::dispatch(&app, &name, &args)).await;
-            match call {
+            let latency_us = t0.elapsed().as_micros() as u64;
+            let (result, is_error) = match call {
                 Ok(Ok(value)) => {
                     let text = serde_json::to_string_pretty(&value).unwrap_or_default();
                     let has_output = tools::tool_registry()
@@ -151,17 +154,19 @@ pub async fn handle_post(State(state): State<Arc<McpState>>, headers: HeaderMap,
                     if has_output {
                         result["structuredContent"] = json!({"result": value});
                     }
-                    result
+                    (result, false)
                 }
-                Ok(Err(msg)) => json!({
+                Ok(Err(msg)) => (json!({
                     "content": [{"type": "text", "text": msg}],
                     "isError": true
-                }),
-                Err(e) => json!({
+                }), true),
+                Err(e) => (json!({
                     "content": [{"type": "text", "text": format!("Tool execution failed: {e}")}],
                     "isError": true
-                }),
-            }
+                }), true),
+            };
+            state.app.metrics.record_tool(&name_for_schema, is_error, latency_us);
+            result
         }
         _ => {
             return (
@@ -201,4 +206,39 @@ pub async fn handle_delete(State(state): State<Arc<McpState>>, headers: HeaderMa
         state.streams.lock().unwrap().remove(&sid);
     }
     (StatusCode::OK, Json(json!({}))).into_response()
+}
+
+/// Liveness/readiness probe (#6). No MCP session required.
+pub async fn handle_health(State(state): State<Arc<McpState>>) -> Response {
+    let app = &state.app;
+    let facts = app.store.get_stats().ok();
+    let total = facts.as_ref().and_then(|f| f.get("total_facts")).and_then(|v| v.as_i64()).unwrap_or(-1);
+    let model = app.store.model_name.read().unwrap().clone();
+    let body = json!({
+        "status": "ok",
+        "server": "rlm-rs",
+        "version": env!("CARGO_PKG_VERSION"),
+        "uptime_secs": app.metrics.uptime_secs(),
+        "total_facts": total,
+        "embedding_model": model,
+        "embeddings_enabled": app.embedder.is_some(),
+        "reranker_enabled": app.router.reranker.enabled,
+        "reranker_url": app.router.reranker.url,
+    });
+    (StatusCode::OK, Json(body)).into_response()
+}
+
+/// Metrics endpoint (#6): Prometheus text by default, JSON with ?format=json.
+pub async fn handle_metrics(State(state): State<Arc<McpState>>, uri: axum::http::Uri) -> Response {
+    let want_json = uri.query().map(|q| q.contains("format=json")).unwrap_or(false);
+    if want_json {
+        (StatusCode::OK, Json(state.app.metrics.snapshot())).into_response()
+    } else {
+        (
+            StatusCode::OK,
+            [(header::CONTENT_TYPE, "text/plain; version=0.0.4; charset=utf-8")],
+            state.app.metrics.prometheus(),
+        )
+            .into_response()
+    }
 }

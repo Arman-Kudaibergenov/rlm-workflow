@@ -76,6 +76,11 @@ fn detect_project_type(root: &Path) -> String {
     "unknown".to_string()
 }
 
+#[doc(hidden)]
+pub fn detect_project_type_public(root: &Path) -> String {
+    detect_project_type(root)
+}
+
 fn gather_project_info(root: &Path, ptype: &str) -> ProjectInfo {
     let mut name = root.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
     let mut framework: Option<String> = None;
