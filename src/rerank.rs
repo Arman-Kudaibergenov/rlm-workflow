@@ -73,7 +73,7 @@ impl Reranker {
             }
             Err(e) => {
                 *self.cooldown_until.lock().unwrap() = Some(Instant::now() + self.cooldown);
-                tracing::warn!("[#43] reranker unavailable ({e}) — RRF order kept, cooldown 120s");
+                tracing::warn!("[#43] reranker unavailable ({e:?}) — RRF order kept, cooldown 120s");
                 None
             }
         }

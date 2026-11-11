@@ -170,6 +170,7 @@ impl Router {
             None => facts_with_embeddings.as_slice(),
         };
         let mut pool: Vec<(Fact, Vec<f32>)> = Vec::new();
+        let stale_w = crate::util::stale_weight();
         for (fact, emb) in candidates {
             if fact.level == 0 {
                 continue;
@@ -178,7 +179,7 @@ impl Router {
                 if fact.is_archived {
                     continue;
                 }
-                if !include_stale && fact.is_stale {
+                if fact.is_stale && !include_stale && stale_w <= 0.0 {
                     continue;
                 }
             }
@@ -247,6 +248,16 @@ impl Router {
                     _ => 1.0,
                 };
                 *score *= w;
+            }
+        }
+
+        // Stale down-weight (#3 quality lever): keep old knowledge visible but ranked
+        // below live facts, unless the caller explicitly asked for stale.
+        if !include_stale && stale_w > 0.0 {
+            for (fid, score) in rrf.iter_mut() {
+                if pool_by_id.get(fid).map(|f| f.is_stale).unwrap_or(false) {
+                    *score *= stale_w;
+                }
             }
         }
 

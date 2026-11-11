@@ -82,3 +82,52 @@ systemctl stop rlm-rs.service && systemctl start rlm.service
 
 The Python venv, unit, and data are unchanged; the Rust service reads the same DBs in
 place. DB backup available at the path above.
+
+---
+
+## Quality improvements (2026-11-12, "делай все")
+
+Baseline routing quality was hit@5 = 0.48 (13/27 prod questions). Diagnosis of the 14
+misses: **11 were stale (7) or archived (4) target facts excluded from search**, only 3
+were live facts mis-ranked. So the dominant lever was stale visibility, not the model.
+
+### Stale visibility (`RLM_STALE_WEIGHT`)
+
+Stale facts were hard-excluded; ~72% of the base (5179/7189) was stale and invisible.
+"Stale" is a freshness flag (TTL exceeded), not a correctness judgment. Search/routing
+now include stale facts, ranked by relevance; search still favors fresh facts via its
+recency term. Tunable via `RLM_STALE_WEIGHT` (default **1.0** = fully visible; `0.5` =
+down-weighted; `0` = previous hard-exclude). Archived facts stay excluded.
+
+Measured hit@5 (27 prod questions, English model, reranker available):
+
+| config | hit@5 |
+|---|---|
+| stale excluded (baseline) | 13/27 = 0.48 |
+| stale weight 0.5 | 17/27 = 0.63 |
+| **stale weight 1.0 (shipped default)** | **20/27 = 0.74** |
+
+Garbage-query tests still return empty (relevance gate intact). Regression suites
+unchanged (17/17, 8/9, 20/21, 11/11, 16/16 — same 2 production-data artifacts).
+
+### Multilingual model — evaluated, NOT shipped
+
+`paraphrase-multilingual-MiniLM-L12-v2` loads in candle with cosine parity 1.000000
+(Unigram/Precompiled tokenizer, 12-layer BERT). But on the (English-query) bench it
+scored 0.67 (stale 0.5) / 0.59 (stale 1.0) — below the English model's 0.74 — and its
+~470 MB weights would push RSS from ~106 MB to ~450 MB, undoing the memory win. Kept
+`all-MiniLM-L6-v2`. Revisit if Russian-query usage dominates.
+
+### Reranker
+
+`<reranker-host>:8400` is intermittently unavailable; the circuit-breaker cooldown (120 s)
+falls back to RRF order gracefully (verified `reranked=true` when up). External service,
+not a server defect.
+
+### Perf / ops (also shipped)
+
+- In-memory cache of facts+embeddings (invalidated on mutation) — no per-query re-parse
+  of ~7k JSON vectors.
+- SQLite WAL + `synchronous=NORMAL`.
+- `GET /health` and `GET /metrics` (Prometheus text or `?format=json`).
+- 18 Rust unit tests (`cargo test --release`), all passing.

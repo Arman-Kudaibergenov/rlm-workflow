@@ -32,6 +32,18 @@ pub fn parse_iso(s: &str) -> Option<DateTime<Local>> {
     None
 }
 
+/// Weight applied to stale facts in search/routing (#3 quality lever).
+/// Default 1.0: stale facts stay fully visible and rank by relevance — "stale" is a
+/// freshness flag, not a correctness judgment, and ~72% of the base was stale and
+/// hidden. Search still favors fresh facts via its recency term. Set <1 to down-weight
+/// stale (e.g. 0.5), or 0.0 to restore the previous hard-exclude behavior.
+pub fn stale_weight() -> f64 {
+    std::env::var("RLM_STALE_WEIGHT")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(1.0)
+}
+
 /// Python str slicing by characters (not bytes).
 pub fn char_slice(s: &str, start: usize, len: usize) -> String {
     s.chars().skip(start).take(len).collect()

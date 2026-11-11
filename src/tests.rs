@@ -93,12 +93,18 @@ fn search_keyword_gate_and_garbage() {
 }
 
 #[test]
-fn search_excludes_stale() {
+fn search_stale_visible_not_excluded() {
     let s = Store::new(":memory:").unwrap();
-    let id = s.add_fact("stale pending tasks login", 1, Some("workflow"), None, None, None, None, Some(emb(&[1.0, 0.0])), 1.0, "manual", None).unwrap();
-    s.mark_stale(&id).unwrap();
+    // identical content/embedding: one live, one stale
+    let live = s.add_fact("pending tasks login", 1, Some("workflow"), None, None, None, None, Some(emb(&[1.0, 0.0])), 1.0, "manual", None).unwrap();
+    let stale = s.add_fact("pending tasks login", 1, Some("workflow"), None, None, None, None, Some(emb(&[1.0, 0.0])), 1.0, "manual", None).unwrap();
+    s.mark_stale(&stale).unwrap();
     let r = search::hybrid_search(&s, None, "pending tasks login", 10, 0.5, 0.3, 0.2);
-    assert_eq!(r["results"].as_array().unwrap().len(), 0);
+    let results = r["results"].as_array().unwrap();
+    // default RLM_STALE_WEIGHT=1.0: the stale fact stays visible (was hard-excluded before)
+    assert!(results.len() >= 2);
+    assert!(results.iter().any(|x| x["fact_id"] == live));
+    assert!(results.iter().any(|x| x["fact_id"] == stale));
 }
 
 #[test]

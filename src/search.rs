@@ -48,9 +48,13 @@ pub fn hybrid_search(
         .unwrap_or(0.1);
 
     let mut scored: Vec<(crate::store::Fact, f64)> = Vec::new();
+    let stale_w = util::stale_weight();
 
     for (fact, emb) in facts_with_emb.iter() {
-        if fact.is_stale || is_noise_content(&fact.content) {
+        if is_noise_content(&fact.content) {
+            continue;
+        }
+        if fact.is_stale && stale_w <= 0.0 {
             continue;
         }
         let mut semantic = match (&query_embedding, emb.is_empty()) {
@@ -74,7 +78,10 @@ pub fn hybrid_search(
         let relevance = semantic_weight * semantic + keyword_weight * keyword;
         let age_hours = age_hours(&fact.created_at, &now);
         let recency = (-age_hours / 168.0).exp();
-        let score = relevance + recency_weight * recency;
+        let mut score = relevance + recency_weight * recency;
+        if fact.is_stale {
+            score *= stale_w;
+        }
         scored.push((fact.clone(), score));
     }
 
