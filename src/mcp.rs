@@ -2,7 +2,7 @@
 //! JSON responses to POST, Mcp-Session-Id sessions, SSE GET stream, 202 for
 //! notifications, 404 for unknown sessions.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex};
 
 use axum::body::Bytes;
@@ -15,9 +15,19 @@ use serde_json::{json, Value};
 
 use crate::tools::{self, AppState};
 
+type SseTx = tokio::sync::mpsc::Sender<Result<Event, std::convert::Infallible>>;
+type SseRx = tokio::sync::mpsc::Receiver<Result<Event, std::convert::Infallible>>;
+
+pub struct StreamEntry {
+    // Kept alive so the server->client SSE stream stays open for the session.
+    _tx: SseTx,
+    rx: Option<SseRx>,
+}
+
 pub struct McpState {
     pub app: Arc<AppState>,
     pub sessions: Mutex<HashSet<String>>,
+    pub streams: Mutex<HashMap<String, StreamEntry>>,
 }
 
 const SUPPORTED_VERSIONS: &[&str] = &["2025-06-18", "2025-03-26", "2024-11-05"];
@@ -34,6 +44,8 @@ fn jsonrpc_error(id: &Value, code: i64, message: &str) -> Value {
 }
 
 pub async fn handle_post(State(state): State<Arc<McpState>>, headers: HeaderMap, body: Bytes) -> Response {
+    let accept = headers.get(header::ACCEPT).and_then(|v| v.to_str().ok()).unwrap_or("").to_string();
+    let hdr_sid = session_id(&headers).unwrap_or_default();
     let req: Value = match serde_json::from_slice(&body) {
         Ok(v) => v,
         Err(e) => {
@@ -44,6 +56,13 @@ pub async fn handle_post(State(state): State<Arc<McpState>>, headers: HeaderMap,
                 .into_response();
         }
     };
+    tracing::debug!(
+        "[mcp] POST method={} accept='{}' sid={} body_len={}",
+        req.get("method").and_then(|m| m.as_str()).unwrap_or("?"),
+        accept,
+        if hdr_sid.is_empty() { "-" } else { &hdr_sid[..8.min(hdr_sid.len())] },
+        body.len()
+    );
 
     if req.is_array() {
         return (
@@ -61,6 +80,8 @@ pub async fn handle_post(State(state): State<Arc<McpState>>, headers: HeaderMap,
     if method == "initialize" {
         let sid = uuid::Uuid::new_v4().to_string();
         state.sessions.lock().unwrap().insert(sid.clone());
+        let (tx, rx) = tokio::sync::mpsc::channel::<Result<Event, std::convert::Infallible>>(16);
+        state.streams.lock().unwrap().insert(sid.clone(), StreamEntry { _tx: tx, rx: Some(rx) });
         let requested = params.get("protocolVersion").and_then(|v| v.as_str()).unwrap_or("2025-03-26");
         let negotiated = if SUPPORTED_VERSIONS.contains(&requested) { requested } else { "2025-03-26" };
         let resp = json!({
@@ -155,13 +176,19 @@ pub async fn handle_post(State(state): State<Arc<McpState>>, headers: HeaderMap,
 }
 
 pub async fn handle_get(State(state): State<Arc<McpState>>, headers: HeaderMap) -> Response {
+    let accept = headers.get(header::ACCEPT).and_then(|v| v.to_str().ok()).unwrap_or("").to_string();
+    tracing::debug!("[mcp] GET stream accept='{}' sid={}", accept, session_id(&headers).unwrap_or_default());
     let sid = match session_id(&headers) {
         Some(s) if state.sessions.lock().unwrap().contains(&s) => s,
         _ => return (StatusCode::BAD_REQUEST, "Missing or unknown session ID").into_response(),
     };
-    let _ = sid;
-    // Server->client stream: stays open, no unsolicited messages in this deployment.
-    let (_tx, rx) = tokio::sync::mpsc::channel::<Result<Event, std::convert::Infallible>>(1);
+    // Take the receiver created at initialize; the sender stays in the session map so
+    // the stream remains open for the session lifetime (FastMCP behavior).
+    let rx = state.streams.lock().unwrap().get_mut(&sid).and_then(|e| e.rx.take());
+    let rx = match rx {
+        Some(rx) => rx,
+        None => return (StatusCode::BAD_REQUEST, "Stream already opened for this session").into_response(),
+    };
     let stream = tokio_stream::wrappers::ReceiverStream::new(rx);
     Sse::new(stream)
         .keep_alive(KeepAlive::new().interval(std::time::Duration::from_secs(15)).text("ping"))
@@ -171,6 +198,7 @@ pub async fn handle_get(State(state): State<Arc<McpState>>, headers: HeaderMap) 
 pub async fn handle_delete(State(state): State<Arc<McpState>>, headers: HeaderMap) -> Response {
     if let Some(sid) = session_id(&headers) {
         state.sessions.lock().unwrap().remove(&sid);
+        state.streams.lock().unwrap().remove(&sid);
     }
     (StatusCode::OK, Json(json!({}))).into_response()
 }

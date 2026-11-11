@@ -234,6 +234,7 @@ async fn main() -> Result<()> {
     let mcp_state = Arc::new(mcp::McpState {
         app,
         sessions: std::sync::Mutex::new(std::collections::HashSet::new()),
+        streams: std::sync::Mutex::new(std::collections::HashMap::new()),
     });
     let router_http = axum::Router::new()
         .route(
