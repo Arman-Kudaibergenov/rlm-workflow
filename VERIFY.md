@@ -110,13 +110,24 @@ Measured hit@5 (27 prod questions, English model, reranker available):
 Garbage-query tests still return empty (relevance gate intact). Regression suites
 unchanged (17/17, 8/9, 20/21, 11/11, 16/16 — same 2 production-data artifacts).
 
-### Multilingual model — evaluated, NOT shipped
+### Multilingual model — switched, measured on Russian, reverted (net-negative)
 
 `paraphrase-multilingual-MiniLM-L12-v2` loads in candle with cosine parity 1.000000
-(Unigram/Precompiled tokenizer, 12-layer BERT). But on the (English-query) bench it
-scored 0.67 (stale 0.5) / 0.59 (stale 1.0) — below the English model's 0.74 — and its
-~470 MB weights would push RSS from ~106 MB to ~450 MB, undoing the memory win. Kept
-`all-MiniLM-L6-v2`. Revisit if Russian-query usage dominates.
+(Unigram/Precompiled tokenizer, 12-layer BERT). Per owner request it was switched on prod
+and measured on a **Russian-query bench** (same 27 targets,
+Russian queries):
+
+| model | Russian hit@5 | English hit@5 | RSS |
+|---|---|---|---|
+| all-MiniLM-L6-v2 (English) | 0.41–0.44 | **0.74–0.78** | **~110 MB** |
+| paraphrase-multilingual-MiniLM-L12-v2 | 0.41–0.48 | 0.63 | **792 MB** |
+
+The multilingual model gives **no meaningful Russian gain** (the facts themselves are
+mostly English/code, so a Russian query matches them poorly with either model), costs
+**~7× the memory** (792 MB vs ~110 MB on a 2 GB box), and **hurts English** retrieval
+(0.63 vs 0.78). Reverted prod to `all-MiniLM-L6-v2`. Switch is one env var
+(`RLM_EMBEDDING_MODEL`) + restart (auto-reindex). The real lever for Russian retrieval is
+the English/code fact content, not the embedding model.
 
 ### Reranker
 
