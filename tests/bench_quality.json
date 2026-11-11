@@ -1,0 +1,13 @@
+[
+  {"_comment": "TEMPLATE bench: neutral sample questions. Expectations (substr) must be regenerated against YOUR database — see tests/bench_quality.py docstring. The production bench (real topics, hit@5 1.00) is intentionally not published."},
+  {"q": "postgres backup schedule", "substr": "postgres", "topic": "example-postgres"},
+  {"q": "vpn gateway setup", "substr": "vpn", "topic": "example-vpn"},
+  {"q": "deployment checklist", "substr": "deploy", "topic": "example-deploy"},
+  {"q": "monitoring alert rules", "substr": "alert", "topic": "example-monitoring"},
+  {"q": "api authentication tokens", "substr": "token", "topic": "example-auth"},
+  {"q": "database migration pitfall", "substr": "migration", "topic": "example-migration"},
+  {"q": "docker container networking", "substr": "docker", "topic": "example-docker"},
+  {"q": "release tagging process", "substr": "release", "topic": "example-release"},
+  {"q": "incident postmortem template", "substr": "incident", "topic": "example-incident"},
+  {"q": "service discovery configuration", "substr": "service", "topic": "example-discovery"}
+]

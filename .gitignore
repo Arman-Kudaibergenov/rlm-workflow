@@ -1,0 +1,11 @@
+target/
+testdata/
+pyref/
+reference/
+*.log
+*.pid
+*.db
+*.db-journal
+gitea-cred.txt
+__pycache__/
+*.pyc
