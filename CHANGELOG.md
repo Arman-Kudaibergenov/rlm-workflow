@@ -2,6 +2,21 @@
 
 This file documents all modifications made to the original [RLM-Toolkit](https://github.com/DmitrL-dev/AISecurity/tree/main/rlm-toolkit) by Dmitry Labintcev.
 
+## v3.0.0 (2026-11-16)
+
+Major release: the Rust implementation (`rlm-rs`) becomes primary; the Python reference stays in `docker/`.
+
+### Added
+- **Rust server at the repo root** (`src/`, `Cargo.toml`) — drop-in replacement for the Python deployment: same 18 MCP tools, same schema 2.0.0 (`memory_bridge_v2.db`), MCP streamable-HTTP, `all-MiniLM-L6-v2` embeddings on candle (in-process, no PyTorch). RSS ~110 MB vs ~514 MB.
+- **Search quality** — stale-fact visibility (`RLM_STALE_WEIGHT`, default 1.0): hit@5 0.48 → 0.74 on the production bench; archived facts stay excluded; relevance gate intact.
+- **Ops** — in-memory facts+embeddings cache (invalidated on mutation), SQLite WAL, `GET /health`, `GET /metrics` (Prometheus), 18 Rust unit tests.
+- **Verification evidence** — `VERIFY.md`: tool parity (0 diffs), identical regression pass/fail, embedding cosine 1.000000, multilingual-model experiment (switched, measured, reverted: no Russian gain, ~7× RSS, worse English).
+
+### Changed
+- README presents Rust as the primary implementation; the Python/docker path is the reference.
+- Regression suites parameterized via `RLM_TEST_URL`.
+- Public tree sanitized: production benches (`bench_quality.prod.json`, `bench_quality.ru.json`) are private by design and excluded from the repo; internal hosts/identifiers in tests and verification docs are anonymized.
+
 ## v2.0.1 (2026-08-25)
 
 ### Fixed

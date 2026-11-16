@@ -6,6 +6,7 @@
 data/
 *.db
 *.sqlite
+*.db-journal
 
 # Python
 __pycache__/
@@ -16,8 +17,19 @@ venv/
 dist/
 *.egg-info/
 
+# Rust
+target/
+
 # Docker
 docker/data/
+docker/*.bak-*
+
+# Test / reference artifacts
+testdata/
+pyref/
+reference/
+*.log
+*.pid
 
 # OS
 .DS_Store
@@ -29,6 +41,9 @@ Thumbs.db
 .worktrees/
 .rlm/
 
-# Local prod bench with real topics (not for public repo)
+# Local prod benches with real topics (not for public repo)
 tests/bench_quality.prod.json
-docker/*.bak-*
+tests/bench_quality.ru.json
+
+# Credentials
+gitea-cred.txt

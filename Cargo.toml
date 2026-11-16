@@ -1,0 +1,35 @@
+[package]
+name = "rlm-rs"
+version = "2.0.0"
+edition = "2021"
+description = "RLM hierarchical memory MCP server — Rust rewrite of rlm-toolkit + start_server.py (drop-in compatible)"
+
+[[bin]]
+name = "rlm-rs"
+path = "src/main.rs"
+
+[dependencies]
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "time", "sync", "signal"] }
+axum = { version = "0.8", default-features = false, features = ["http1", "json", "tokio"] }
+rusqlite = { version = "0.32", features = ["bundled"] }
+candle-core = { version = "0.9", default-features = false }
+candle-nn = { version = "0.9", default-features = false }
+tokenizers = { version = "0.21", default-features = false, features = ["fancy-regex"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = { version = "1", features = ["preserve_order"] }
+serde_yaml = "0.9"
+reqwest = { version = "0.12", default-features = false, features = ["blocking", "json", "rustls-tls"] }
+uuid = { version = "1", features = ["v4"] }
+chrono = { version = "0.4", features = ["serde"] }
+regex = "1"
+sha2 = "0.10"
+anyhow = "1"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+tokio-stream = { version = "0.1", features = ["net"] }
+
+[profile.release]
+opt-level = 2
+codegen-units = 16
+lto = false
+strip = true

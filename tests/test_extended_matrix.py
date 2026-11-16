@@ -7,14 +7,15 @@ Zone 3: Context Quality (relevance, noise, clarity)
 Zone 4: Operational Resilience (repeated runs, consistency)
 
 Usage:
-    ssh root@192.168.0.106 "python3 /tmp/test_extended_matrix.py"
+    ssh root@<test-host> "python3 /tmp/test_extended_matrix.py"
 """
 import json
+import os
 import sys
 import time
 import urllib.request
 
-BASE_URL = "http://127.0.0.1:8200/mcp"
+BASE_URL = os.environ.get("RLM_TEST_URL", "http://127.0.0.1:8200/mcp")
 
 
 def _parse_sse(body):
@@ -245,18 +246,18 @@ def zone3_context_quality(s, t):
     # Z3.1: Enterprise context should return relevant facts for specific query
     # First, add a distinctive fact
     s.call("rlm_add_hierarchical_fact", {
-        "content": "Z3_CONTEXT_QUALITY: PostgreSQL connection pool limit is 50 for CT121",
+        "content": "Z3_CONTEXT_QUALITY: PostgreSQL connection pool limit is 50 for <container-id>",
         "domain": "infrastructure",
         "level": 1,
     })
 
     r = s.call("rlm_enterprise_context", {
-        "query": "PostgreSQL connection pool CT121",
+        "query": "PostgreSQL connection pool <container-id>",
         "max_tokens": 2000,
     })
     c = get_content(r)
     ctx = c.get("context", "")
-    has_relevant = "PostgreSQL" in ctx or "connection pool" in ctx or "CT121" in ctx
+    has_relevant = "PostgreSQL" in ctx or "connection pool" in ctx or "<container-id>" in ctx
     t.test(
         "Z3.1 Enterprise context returns relevant facts",
         c.get("status") == "success" and has_relevant,

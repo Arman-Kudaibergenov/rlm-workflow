@@ -1,20 +1,21 @@
 #!/usr/bin/env python3
-"""Full test matrix from issue #25 — runs inside CT106 via docker exec.
+"""Full test matrix from issue #25 — runs inside <container-id> via docker exec.
 
 Usage:
-    # From CT106:
+    # From <container-id>:
     docker exec rlm python3 /tmp/test_mcp_matrix.py
 
     # From Windows (via SSH):
-    scp tests/test_mcp_matrix.py root@192.168.0.106:/tmp/
-    ssh root@192.168.0.106 "docker exec rlm python3 /tmp/test_mcp_matrix.py"
+    scp tests/test_mcp_matrix.py root@<test-host>:/tmp/
+    ssh root@<test-host> "docker exec rlm python3 /tmp/test_mcp_matrix.py"
 """
 import json
+import os
 import subprocess
 import sys
 import urllib.request
 
-BASE_URL = "http://127.0.0.1:8200/mcp"
+BASE_URL = os.environ.get("RLM_TEST_URL", "http://127.0.0.1:8200/mcp")
 
 
 def _parse_sse(body):
